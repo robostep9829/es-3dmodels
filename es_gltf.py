@@ -206,6 +206,24 @@ def mat4_identity():
             (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0))
 
 
+def mat4_inverse(m):
+    """General 4x4 inverse (Gauss-Jordan). For rebinding stale skins."""
+    rows = [[float(m[i][j]) if j < 4 else (1.0 if i == j - 4 else 0.0)
+             for j in range(8)] for i in range(4)]
+    for col in range(4):
+        piv = max(range(col, 4), key=lambda r: abs(rows[r][col]))
+        if abs(rows[piv][col]) < 1e-12:
+            raise ValueError("singular matrix")
+        rows[col], rows[piv] = rows[piv], rows[col]
+        div = rows[col][col]
+        rows[col] = [x / div for x in rows[col]]
+        for r in range(4):
+            if r != col and rows[r][col] != 0.0:
+                f = rows[r][col]
+                rows[r] = [a - f * b for a, b in zip(rows[r], rows[col])]
+    return tuple(tuple(rows[i][4:8]) for i in range(4))
+
+
 def mat4_transform_point(m, p):
     x, y, z = p
     return (m[0][0] * x + m[0][1] * y + m[0][2] * z + m[0][3],

@@ -29,6 +29,8 @@ import es_step3
 import es_shaders
 import es_gltf
 
+print("ES_BUILD rebind-active skeleton-consistent-ibm")
+
 
 def es_gltf_bind(path, target=300.0):
     """Load a .gltf/.glb bind pose: (verts, normals, tris), fit to target."""
@@ -49,7 +51,7 @@ class Material(object):
                  light_dir=None,
                  shininess=16.0, ambient=0.3, diffuse=0.7,
                  spec_weight=0.5, specular=True, normal_viz=False,
-                 skinned=False, max_bones=24):
+                 skinned=False, max_bones=24, bind_pose=False):
         self.base_color = base_color
         self.light_dir = light_dir
         self.shininess = shininess
@@ -60,12 +62,14 @@ class Material(object):
         self.normal_viz = normal_viz
         self.skinned = skinned
         self.max_bones = max_bones
+        self.bind_pose = bind_pose
 
     def variant_key(self):
         return (bool(self.specular), bool(self.normal_viz),
                 float(self.shininess), float(self.ambient),
                 float(self.diffuse), float(self.spec_weight),
-                bool(self.skinned), int(self.max_bones))
+                bool(self.skinned), int(self.max_bones),
+                bool(self.bind_pose))
 
     def shader_name(self):
         try:
@@ -73,7 +77,8 @@ class Material(object):
                 specular=self.specular, normal_viz=self.normal_viz,
                 shininess=self.shininess, ambient=self.ambient,
                 diffuse=self.diffuse, spec_weight=self.spec_weight,
-                skinned=self.skinned, max_bones=self.max_bones)
+                skinned=self.skinned, max_bones=self.max_bones,
+                bind_pose=self.bind_pose)
         except Exception:
             return es_shaders.ensure_fallback()
 
@@ -273,6 +278,32 @@ class Skeleton(object):
         # overrides: node idx -> ("quat", (x,y,z,w)) replacing rotation
         self.overrides = {}
         self.worlds = {}
+        # Rebind: the file's inverse-bind matches a different node pose
+        # than the file's node TRS (retopo asset). Rest = node-defined
+        # bind (matches the rigid demos), so invert THOSE worlds.
+        _bind = {}
+        for ni in self.order:
+            if ni in self.parent:
+                _bind[ni] = es_gltf.mat4_mul(
+                    _bind[self.parent[ni]], self._local_of(ni, {}))
+            else:
+                _bind[ni] = self._local_of(ni, {})
+        self.inverse_bind = [
+            es_gltf.mat4_inverse(_bind[ni]) for ni in self.joint_nodes]
+
+    def _local_of(self, ni, overrides):
+        import es_gltf
+        spec = self.base_local[ni]
+        if ni in overrides:
+            _, q = overrides[ni]
+            if spec[0] == "matrix":
+                return spec[1]
+            _, t, _r, s = spec
+            return es_gltf.mat4_trs(t, q, s)
+        if spec[0] == "matrix":
+            return spec[1]
+        _, t, r, s = spec
+        return es_gltf.mat4_trs(t, r, s)
 
     def joint_index(self, name_or_idx):
         if isinstance(name_or_idx, int):
@@ -309,20 +340,8 @@ class Skeleton(object):
         """Recompute world matrices. Returns {joint_idx: mat4}."""
         import es_gltf
         local = {}
-        for ni, spec in self.base_local.items():
-            if ni in self.overrides:
-                _, q = self.overrides[ni]
-                if spec[0] == "matrix":
-                    local[ni] = spec[1]
-                else:
-                    _, t, _r, s = spec
-                    local[ni] = es_gltf.mat4_trs(t, q, s)
-            else:
-                if spec[0] == "matrix":
-                    local[ni] = spec[1]
-                else:
-                    _, t, r, s = spec
-                    local[ni] = es_gltf.mat4_trs(t, r, s)
+        for ni in self.base_local:
+            local[ni] = self._local_of(ni, self.overrides)
         worlds = {}
         for ni in self.order:
             if ni in self.parent:
@@ -370,7 +389,7 @@ class SkinnedObject(Object3D):
             wts = gltf.read_accessor(p["weights"], normalize=True)
             m = (world[p["nodes"][0]] if p["nodes"]
                  else es_gltf.mat4_identity())
-            prims.append((pos, nor, idx, jts, wts, m))
+            prims.append((pos, nor, idx, jts, wts, m, p["material"]))
             for v in pos:
                 wv = es_gltf.mat4_transform_point(m, v)
                 for k in range(3):
@@ -381,8 +400,15 @@ class SkinnedObject(Object3D):
         extent = max(all_max[k] - all_min[k] for k in range(3)) or 1.0
         scale = target / extent
         center = [(all_min[k] + all_max[k]) / 2.0 for k in range(3)]
+        print("ES_FIT nprims=%d extent=%.3f scale=%.3f center=%r size=%.1f target=%.1f" % (
+            len(prims), extent, scale,
+            tuple(round(x, 3) for x in center), self.size, target))
         cap = self.material.max_bones
-        for pos, nor, idx, jts, wts, m in prims:
+        # Condense by material first: merge primitives sharing a material
+        # into one pool, then joint-split each pool. Fewer state changes
+        # per material, and a home for future per-material maps.
+        pools = {}
+        for pos, nor, idx, jts, wts, m, mat in prims:
             v = [((es_gltf.mat4_transform_point(m, p)[0] - center[0]) * scale,
                   (es_gltf.mat4_transform_point(m, p)[1] - center[1]) * scale,
                   (es_gltf.mat4_transform_point(m, p)[2] - center[2]) * scale)
@@ -392,9 +418,21 @@ class SkinnedObject(Object3D):
                 l = (nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]) ** 0.5 or 1.0
                 n.append(es_gltf.mat4_transform_dir(
                     m, (nn[0] / l, nn[1] / l, nn[2] / l)))
-            tris = [tuple(idx[k:k + 3]) for k in range(0, len(idx), 3)]
-            jj = [tuple(int(x) for x in row) for row in jts]
-            ww = [tuple(float(x) for x in row) for row in wts]
+            pool = pools.setdefault(mat, {"v": [], "n": [], "t": [],
+                                           "jj": [], "ww": []})
+            base = len(pool["v"])
+            pool["v"].extend(v)
+            pool["n"].extend(n)
+            pool["jj"].extend([tuple(int(x) for x in row) for row in jts])
+            pool["ww"].extend([tuple(float(x) for x in row) for row in wts])
+            pool["t"].extend([tuple(base + x for x in idx[k:k + 3])
+                              for k in range(0, len(idx), 3)])
+        print("ES_MATS groups=%d tris=%r" % (
+            len(pools),
+            sorted([(mat, len(p["t"])) for mat, p in pools.items()])))
+        for mat, pool in sorted(pools.items(), key=lambda kv: str(kv[0])):
+            v, n, tris, jj, ww = (pool["v"], pool["n"], pool["t"],
+                                 pool["jj"], pool["ww"])
             for sub_tris, local in es_gltf.split_by_joints(tris, jj, ww, cap):
                 used = set()
                 for tri in sub_tris:
@@ -418,13 +456,36 @@ class SkinnedObject(Object3D):
                         if (float(w) > 0.0 and int(x) in _loc) else 0.0
                         for x, w in zip(jj[g], ww[g]))
                     sw[l] = ww[g]
-                st = [tuple(remap[x] for x in (tri[0], tri[2], tri[1]))
-                      for tri in sub_tris]
+                st = [tuple(remap[x] for x in tri) for tri in sub_tris]
                 mesh = es_step3.mesh3_from_layout(
                     sv, [sj, sw, sn], st,
                     [("a_joints", 4), ("a_weights", 4), ("a_norm3", 3)])
                 self.splits.append({"mesh": mesh, "palette": local,
                                     "model": None})
+        # FIT-преобразование буфер<->rig: P_buf = FIT * X * FITINV,
+        # где X = update() (уже W * ibm слитно). Отдельного Q не нужно:
+        # worlds[] из update() уже содержит W*ibm, домножать ibm еще
+        # раз (как раньше через _joint_q) — двойное применение.
+        # (M mesh-узлов здесь I; иначе нужен еще M * ... * M^-1.)
+        _IQ = (0.0, 0.0, 0.0, 1.0)
+        _B = (s, s, 0.0)
+        _TB = es_gltf.mat4_trs(_B, _IQ, (1.0, 1.0, 1.0))
+        _TnB = es_gltf.mat4_trs(tuple(-x for x in _B), _IQ,
+                                (1.0, 1.0, 1.0))
+        _F = es_gltf.mat4_trs((0.0, 0.0, 0.0), _IQ, (1.0, -1.0, 1.0))
+        _S = es_gltf.mat4_trs((0.0, 0.0, 0.0), _IQ,
+                              (scale, scale, scale))
+        _SI = es_gltf.mat4_trs((0.0, 0.0, 0.0), _IQ,
+                               (1.0 / scale, 1.0 / scale, 1.0 / scale))
+        _Tmc = es_gltf.mat4_trs(tuple(-x for x in center), _IQ,
+                                (1.0, 1.0, 1.0))
+        _Tc = es_gltf.mat4_trs(tuple(center), _IQ, (1.0, 1.0, 1.0))
+        _fit = es_gltf.mat4_mul(es_gltf.mat4_mul(es_gltf.mat4_mul(_TB, _F),
+                                                _S), _Tmc)
+        _fitinv = es_gltf.mat4_mul(es_gltf.mat4_mul(es_gltf.mat4_mul(_Tc, _SI),
+                                                   _F), _TnB)
+        self._fit = _fit
+        self._fitinv = _fitinv
 
     def update(self, st, dt):
         self.angle = (st * self.speed) % 360.0
@@ -443,21 +504,13 @@ class SkinnedView(Displayable):
             m = renpy.display.model.Model(size=(obj.size, obj.size))
             m.shader("renpy.geometry")
             m.shader(obj.material.shader_name())
-            m.property("depth", True)
+            # Без личного depth: общий клеар — на родителе (см. render),
+            # иначе каждый сплит чистит буфер и рушит окклюзию соседей.
             m.uniform("u_view_dir", Object3D.view_dir)
             m.uniform("u_base_color", obj.material.base_color)
             m._mesh = sp["mesh"]
             sp["model"] = m
             self.models.append(m)
-
-    @staticmethod
-    def _flip_y(mat):
-        # Conjugate Y-flip F*P*F, F=diag(1,-1,1): negate row/col 1
-        # except the [1][1] diagonal. Matches the baked vert flip.
-        return tuple(
-            tuple(-mat[i][j] if (i == 1) != (j == 1) else mat[i][j]
-                  for j in range(4))
-            for i in range(4))
 
     @staticmethod
     def _flat16(mat):
@@ -480,8 +533,12 @@ class SkinnedView(Displayable):
                                       0.0, 0.0, 0.0, 1.0])
         for sp, m in zip(self._splits, self.models):
             for li, ji in enumerate(sp["palette"]):
-                flat = SkinnedView._flat16(
-                    SkinnedView._flip_y(worlds[ji]))
+                # Палитра в пространстве буфера: FIT * X * FITINV, где X —
+                # update() (уже W * ibm слитно). Отдельного Q не нужно.
+                _P = es_gltf.mat4_mul(
+                    es_gltf.mat4_mul(obj._fit, worlds[ji]),
+                    obj._fitinv)
+                flat = SkinnedView._flat16(_P)
                 m.uniform("u_bone%d" % li, _Matrix(flat))
             # draw() требует ВСЕ объявленные uniform'ы: добиваем identity.
             for li in range(len(sp["palette"]), nbones):
@@ -489,6 +546,10 @@ class SkinnedView(Displayable):
             m.uniform("u_spin", obj.angle)
             m.uniform("u_light_dir", light)
         rv = renpy.display.render.Render(int(obj.size), int(obj.size))
+        # Один depth-клеар на всех соседей: draw() чистит буфер в узле
+        # с property depth и ставит has_depth наследникам — сплиты делят
+        # один тест вместо 30 чисток (иначе порядок неверный).
+        rv.add_property("depth", True)
         for sp, m in zip(self._splits, self.models):
             cr = renpy.display.render.render(
                 _TransformWrap(m, obj), obj.size, obj.size, st, at)

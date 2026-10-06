@@ -26,14 +26,14 @@ init python:
             self.angle = (st * 45.0) % 360.0
 
     class Nodding(_eng.SkinnedObject):
-        # Turntable + two-joint nod (bend distributed Neck->Head).
+        # Turn (not nod): symmetric motion reads pivot position clearly.
+        # Bend distributed Neck->Head across the weight gradient.
         def update(self, st, dt):
             super(Nodding, self).update(st, dt)
             import math as _m
-            ph = _m.sin(st * 1.5)
-            self.skel.pose_euler("Neck", rx=4.0 * ph)
-            self.skel.pose_euler("Head", rx=6.0 * ph,
-                                 ry=3.0 * _m.sin(st * 0.9))
+            ph = _m.sin(st * 1.1)
+            self.skel.pose_euler("Neck", ry=3.0 * ph)
+            self.skel.pose_euler("Head", ry=7.0 * ph)
 
 init:
     $ mods["es_3dmodels"]=u"Просто тестовый мод"
@@ -68,7 +68,8 @@ label es_3dmodels:
         show expression _view4 as glb_view at center
         "glTF bind-pose: 5 мешей, 18.5k tris, жесткий проворот."
         hide glb_view
-        $ _nod = Nodding(_glbpath, size=600.0, speed=20.0)
+        $ _nod = Nodding(_glbpath, size=950.0, speed=0.0, tilt=0.0,
+                         target=850.0)
         $ _view5 = _eng.SkinnedView(_nod)
         $ _vname = _nod.material.shader_name()
         "Вариант шейдера: [_vname]"

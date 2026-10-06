@@ -70,6 +70,12 @@ vec3 skP = (es_sm * vec4(a_position.xyz, 1.0)).xyz;
 vec3 skN = mat3(es_sm) * a_norm3;
 """
 
+# Диагностика: обход скиннинга (позиции/нормали как есть).
+_SKIN_IDENTITY = """
+vec3 skP = a_position.xyz;
+vec3 skN = a_norm3;
+"""
+
 # Analytic normal rotation. Row order copies rotate_matrix(x, y, 0)
 # from matrix_functions.pxi, so it matches Matrix.rotate(tilt, angle, 0).
 _VERTEX = """
@@ -157,11 +163,11 @@ def _skin_pick(n):
 
 def get_variant(specular=True, normal_viz=False, shininess=16.0,
                 ambient=0.3, diffuse=0.7, spec_weight=0.5,
-                skinned=False, max_bones=24):
+                skinned=False, max_bones=24, bind_pose=False):
     """Return a registered shader name for this feature combination."""
     key = (bool(specular), bool(normal_viz), float(shininess),
            float(ambient), float(diffuse), float(spec_weight),
-           bool(skinned), int(max_bones))
+           bool(skinned), int(max_bones), bool(bind_pose))
     if key in VARIANTS:
         return VARIANTS[key]
     if normal_viz:
@@ -181,8 +187,12 @@ def get_variant(specular=True, normal_viz=False, shininess=16.0,
         variables = variables + (_NORMAL_DECL % "a_norm3")
         variables = variables + _skin_decls(n)
         vfuncs = _skin_pick(n)
-        vertex = ((_SKIN_BLEND % {"n": n}) + "\n" +
-                  _VERTEX_SPIN + _VERTEX)
+        if bind_pose:
+            vertex = (_SKIN_IDENTITY + "\n" +
+                      _VERTEX_SPIN + _VERTEX)
+        else:
+            vertex = ((_SKIN_BLEND % {"n": n}) + "\n" +
+                      _VERTEX_SPIN + _VERTEX)
     else:
         variables = variables + (_NORMAL_DECL % "a_normal")
         vertex = _VERTEX_RIGID + "\n" + _VERTEX_SPIN + _VERTEX
