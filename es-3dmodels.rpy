@@ -87,91 +87,61 @@ init python:
         _sys2.path.insert(0, _md2)
 
     import es_step3 as _s3
-    import math as _math2
 
     class SpinCube(renpy.Displayable):
-        # Меш выделяется ОДИН раз; каждый кадр вершины+нормали переписываются
-        # на месте (без malloc/free). Пивот/позиция — baked-математикой.
-        def __init__(self, size=400.0, speed=120.0, frozen=None, **kwargs):
+        # Вращение — матрицей модели (matrixtransform, пивот авто-центр бокса).
+        # Меш СТАТИЧНЫЙ (один аплоад); в кадре меняется только uniform u_spin.
+        # Формула поворота нормалей в шейдере — строки rotate_matrix из matrix_functions.pxi.
+        def __init__(self, size=400.0, speed=120.0, **kwargs):
             super(SpinCube, self).__init__(**kwargs)
             self.size = size
             self.speed = speed
-            self.frozen = frozen
+            s = size / 2.0
             bv = [(-1,-1,-1),(1,-1,-1),(1,1,-1),(-1,1,-1),
                   (-1,-1,1),(1,-1,1),(1,1,1),(-1,1,1)]
-            self.base_v, self.base_n, self.tris = [], [], []
-            self.quads = [([0,1,2,3],(0,0,1)),([4,5,6,7],(0,0,-1)),
-                          ([0,1,5,4],(0,1,0)),([2,3,7,6],(0,-1,0)),
-                          ([0,3,7,4],(1,0,0)),([1,2,6,5],(-1,0,0))]
+            self.base_n = []
+            self.quads = [([0,1,2,3],(0,0,-1)),([4,5,6,7],(0,0,1)),
+                          ([0,1,5,4],(0,-1,0)),([2,3,7,6],(0,1,0)),
+                          ([0,3,7,4],(-1,0,0)),([1,2,6,5],(1,0,0))]
+            base_v, tris = [], []
             for q, n_ in self.quads:
-                b = len(self.base_v)
+                b = len(base_v)
                 for i in q:
-                    self.base_v.append((bv[i][0]*150.0, bv[i][1]*150.0, bv[i][2]*150.0))
+                    base_v.append((s + bv[i][0]*150.0, s + bv[i][1]*150.0, bv[i][2]*150.0))
                     self.base_n.append(n_)
-                self.tris.append((b+0,b+1,b+2)); self.tris.append((b+0,b+2,b+3))
-            self.mesh = _s3.mesh3_from_lists(self.base_v, self.base_n, self.tris)
+                tris.append((b+0,b+1,b+2)); tris.append((b+0,b+2,b+3))
+            self.mesh = _s3.mesh3_from_lists(base_v, self.base_n, tris)
             self.model = renpy.display.model.Model(size=(size, size))
             self.model.shader("renpy.geometry")
             self.model.shader("es_blinn_phong")
-            # БЕЗ depth: в offscreen-FBO нет depth-буфера (config.depth_size=0),
-            # включенный DEPTH_TEST режет все фрагменты. Вместо этого CPU-culling.
+            # Эксперимент: DEPTH_TEST против оконного depth-буфера (в FB tab он есть,
+            # пуст). Показ — БЕЗ dissolve, иначе render_to_texture в FBO без depth.
+            self.model.property("depth", True)
             self.model.uniform("u_light_dir", (0.5,-0.8,0.7))
             self.model.uniform("u_view_dir", (0.0,0.0,1.0))
             self.model.uniform("u_base_color", (0.9,0.3,0.3,1.0))
             self.model.uniform("u_shininess", 16.0)
+            self.model.uniform("u_spin", 0.0)
             self.model._mesh = self.mesh
         def render(self, w, h, st, at):
-            ay = _math2.radians(self.frozen if self.frozen is not None else (st * self.speed) % 360.0)
-            ax = _math2.radians(25.0)
-            cy, sy = _math2.cos(ay), _math2.sin(ay)
-            cx, sx = _math2.cos(ax), _math2.sin(ax)
-            s = self.size / 2.0
-            vv, nn = [], []
-            for (x, y, z) in self.base_v:
-                x1 = x * cy + z * sy
-                z1 = -x * sy + z * cy
-                y1 = y * cx - z1 * sx
-                z2 = y * sx + z1 * cx
-                vv.append((s + x1, s + y1, z2))
-            for (x, y, z) in self.base_n:
-                x1 = x * cy + z * sy
-                z1 = -x * sy + z * cy
-                y1 = y * cx - z1 * sx
-                z2 = y * sx + z1 * cx
-                nn.append((x1, y1, z2))
-            _s3.mesh3_update(self.mesh, vv, nn)
-            # CPU backface-culling: грани с нормалью от камеры не сабмитим.
-            # Квады лежат блоками по 4 вершины / 2 треугольника (см. __init__).
-            _tris, _qi = [], 0
-            for _qn in self.quads:
-                _nx, _ny, _nz = nn[_qi * 4]
-                if _nz > 0.0:
-                    _b = _qi * 4
-                    _tris.append((_b+0,_b+1,_b+2)); _tris.append((_b+0,_b+2,_b+3))
-                _qi += 1
-            _s3.mesh3_update_tris(self.mesh, _tris)
-            if self.frozen is None:
-                renpy.redraw(self, 0.016)
+            # Окклюзия — DEPTH_TEST против оконного depth-буфера (прямой draw,
+            # без dissolve). Здесь только угол для шейдера; сабмит всегда полный.
+            a = (st * self.speed) % 360.0
+            self.model.uniform("u_spin", a)
+            renpy.redraw(self, 0.016)
             return renpy.display.render.render(self.model, w, h, st, at)
 
-    def make_gpu_quad():
-        # Отладка: плоский квад z=0 с центром (0,0,0).
-        import es_step3 as _s3q
-        v = [(-150.0,-150.0,0.0),(150.0,-150.0,0.0),(150.0,150.0,0.0),(-150.0,150.0,0.0)]
-        n = [(0.0,0.0,1.0)]*4
-        t = [(0,1,2),(0,2,3)]
-        m = renpy.display.model.Model(size=(400, 400))
-        m.shader("renpy.geometry")
-        m.shader("es_blinn_phong")
-        m.uniform("u_light_dir", (0.0,0.0,1.0))
-        m.uniform("u_view_dir", (0.0,0.0,1.0))
-        m.uniform("u_base_color", (0.9,0.3,0.3,1.0))
-        m.uniform("u_shininess", 32.0)
-        m._mesh = _s3q.mesh3_from_lists(v, n, t)
-        return m
+    def spin_mtx(trans, st, at):
+        # Пивот — авто-центр бокса (matrixanchor по умолчанию w/2,h/2).
+        trans.matrixtransform = Matrix.rotate(25.0, (st * 120.0) % 360.0, 0.0)
+        return 0.016
 
 init:
     $ mods["es_3dmodels"]=u"Просто тестовый мод"
+    transform gpu_spin:
+        align (0.5, 0.5)
+        perspective True
+        function spin_mtx
 label es_3dmodels:
     "Я говорю..."
     "[_gl_info]"
@@ -181,9 +151,9 @@ label es_3dmodels:
     $ _RENDER_PATH = "GPU: Model/es_blinn_phong/SpinCube" if _GPU_READY else "CPU: canvas.polygon Blinn-Phong"
     "Рендер: [_RENDER_PATH]"
     if _GPU_READY:
-        show expression SpinCube(size=400.0) as gltest at center with dissolve
-        "GPU-куб: Blinn-Phong на видеокарте, вращение запечено в вершины."
-        hide gltest with dissolve
+        show expression SpinCube(size=400.0) as gltest at gpu_spin
+        "GPU-куб: вращение матрицей, свет — шейдер, окклюзия — depth-тест."
+        hide gltest
     else:
         "ВНИМАНИЕ: GPU-пайплайн недоступен ([_GPU_ERR]) — запасной CPU-рендер."
         show expression Cube(size=400.0) as gltest at center with dissolve
