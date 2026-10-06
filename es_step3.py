@@ -62,10 +62,17 @@ def mesh3_update(m, verts, normals):
     ctypes.memmove(p_attr, narr.tostring(), len(narr.tostring()))
     return m
 
+def mesh3_read_attrib(m, count=11):
+    """Read back the first `count` floats of the attribute buffer."""
+    import ctypes as _ct
+    p_attr = _ADDRS[id(m)][1]
+    raw = _ct.string_at(p_attr, count * 4)
+    return list(struct.unpack("<%df" % count, raw))
+
+
 def mesh3_update_tris(m, tris):
     # Перезапись индексного буфера + счетчика (для CPU-culling без depth-буфера).
     import ctypes as _ct
-    base = None
     p_point, p_attr, p_tri = _ADDRS[id(m)]
     tarr = array.array("H")
     for a, b, c_ in tris:
@@ -75,4 +82,38 @@ def mesh3_update_tris(m, tris):
     import ctypes as _ct2, struct as _st
     _base = id(m)
     _ct2.memmove(_base + OFF_TRIS, _st.pack("i", len(tris)), 4)
+    return m
+
+
+def mesh3_from_layout(verts, attrib_frames, tris, layout_spec):
+    """Generic builder. layout_spec: [(name, floats)], attrib_frames: list of
+    per-vert float lists in the same order. Attributes packed interleaved."""
+    from renpy.gl2.gl2mesh3 import Mesh3
+    from renpy.gl2.gl2mesh import AttributeLayout as AL
+    l = AL()
+    for name, size in layout_spec:
+        l.add_attribute(name, size)
+    n, t = len(verts), len(tris)
+    m = Mesh3(l, n, t)
+    base = id(m)
+    ctypes.memmove(base + OFF_POINTS, struct.pack("i", n), 4)
+    ctypes.memmove(base + OFF_TRIS, struct.pack("i", t), 4)
+    parr = array.array("f")
+    for v in verts:
+        parr.extend([float(v[0]), float(v[1]), float(v[2])])
+    farr = array.array("f")
+    for k in range(n):
+        for frame in attrib_frames:
+            for x in frame[k]:
+                farr.append(float(x))
+    tarr = array.array("H")
+    for a, b, c_ in tris:
+        tarr.extend([int(a), int(b), int(c_)])
+    p_point = _ptr(base, OFF_POINT)
+    p_attr = _ptr(base, OFF_ATTR)
+    p_tri = _ptr(base, OFF_TRI)
+    ctypes.memmove(p_point, parr.tostring(), len(parr.tostring()))
+    ctypes.memmove(p_attr, farr.tostring(), len(farr.tostring()))
+    ctypes.memmove(p_tri, tarr.tostring(), len(tarr.tostring()))
+    _ADDRS[id(m)] = (p_point, p_attr, p_tri)
     return m
