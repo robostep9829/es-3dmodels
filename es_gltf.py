@@ -3,9 +3,10 @@
 
 Covers what the engine consumes: POSITION / NORMAL / INDICES /
 JOINTS_0 / WEIGHTS_0, skins (joints + inverseBindMatrices), node TRS
-hierarchy, animation samplers. Everything else (textures, PBR factors
-beyond base color, morphs, sparse accessors) is ignored, never crashed on:
-unknown chunks raise ValueError with context, never segfault.
+hierarchy, animation samplers, morph targets (incl. sparse accessors).
+Everything else (textures, PBR factors beyond base color) is ignored,
+never crashed on: unknown chunks raise ValueError with context, never
+segfault.
 
 Reference-checked against cgltf.h (bundled for reading) for stride,
 normalization and sampler rules.
@@ -89,11 +90,8 @@ class Gltf(object):
                 with open(os.path.join(base, uri), "rb") as f:
                     self.bins.append(f.read())
 
-    def read_accessor(self, idx, normalize=False):
-        """Returns a list of tuples. Bounds-checked; no raw pointer math."""
-        a = self.json["accessors"][idx]
-        if "sparse" in a:
-            raise ValueError("sparse accessors unsupported (accessor %d)" % idx)
+    def _read_dense(self, a, normalize):
+        """Read `count` tightly-strided elements from a["bufferView"]."""
         v = self.json["bufferViews"][a["bufferView"]]
         buf = self.bins[v.get("buffer", 0)]
         fmt, size = _COMP[a["componentType"]]
@@ -102,7 +100,8 @@ class Gltf(object):
         base = v.get("byteOffset", 0) + a.get("byteOffset", 0)
         count = a["count"]
         if base + (count - 1) * stride + ncomp * size > len(buf):
-            raise ValueError("accessor %d out of range" % idx)
+            raise ValueError("accessor out of range (bufferView %s)" %
+                             (a["bufferView"],))
         out = []
         for k in range(count):
             vals = struct.unpack_from("<%d%s" % (ncomp, fmt), buf,
@@ -118,9 +117,49 @@ class Gltf(object):
                 out.append(vals if ncomp > 1 else vals[0])
         return out
 
+    def read_accessor(self, idx, normalize=False):
+        """Returns a list of tuples. Bounds-checked; no raw pointer math.
+
+        Sparse accessors are supported: zero base (or a dense base)
+        patched in place by the sparse index/value run, per glTF 2.0."""
+        a = self.json["accessors"][idx]
+        ncomp = _NCOMP[a["type"]]
+        if "bufferView" in a:
+            out = self._read_dense(a, normalize)
+        else:
+            zero = tuple(0.0 for _ in range(ncomp))
+            out = [zero if ncomp > 1 else 0.0] * a["count"]
+        sp = a.get("sparse")
+        if sp:
+            n = sp["count"]
+            ia = sp["indices"]
+            iv = self.json["bufferViews"][ia["bufferView"]]
+            ibuf = self.bins[iv.get("buffer", 0)]
+            ifmt, isize = _COMP[ia["componentType"]]
+            istr = iv.get("byteStride", 0) or isize
+            ibase = iv.get("byteOffset", 0) + ia.get("byteOffset", 0)
+            if n > 0 and ibase + (n - 1) * istr + isize > len(ibuf):
+                raise ValueError("sparse indices out of range (accessor %d)"
+                                 % idx)
+            va = sp["values"]
+            vals = self._read_dense(
+                {"bufferView": va["bufferView"],
+                 "byteOffset": va.get("byteOffset", 0),
+                 "count": n,
+                 "componentType": a["componentType"],
+                 "type": a["type"],
+                 "normalized": a.get("normalized", False)}, normalize)
+            for k in range(n):
+                vi = struct.unpack_from("<%s" % ifmt, ibuf,
+                                        ibase + k * istr)[0]
+                out[vi] = vals[k]
+        return out
+
     def primitives(self):
         """Yields dicts: name, indices, POSITION/NORMAL/JOINTS_0/WEIGHTS_0
-        accessor ids (or None), material, node_matrix (or None)."""
+        accessor ids (or None), material, node_matrix (or None), plus morph
+        data: targets (list of {semantic: accessor} or None), target_names
+        (mesh extras list or None), weights (mesh morph weights or None)."""
         js = self.json
         node_of_mesh = {}
         for ni, node in enumerate(js.get("nodes", [])):
@@ -138,7 +177,11 @@ class Gltf(object):
                        "joints": at.get("JOINTS_0"),
                        "weights": at.get("WEIGHTS_0"),
                        "material": p.get("material"),
-                       "nodes": node_of_mesh.get(mi, [])}
+                       "nodes": node_of_mesh.get(mi, []),
+                       "targets": p.get("targets"),
+                       "target_names":
+                           mesh.get("extras", {}).get("targetNames"),
+                       "mesh_weights": mesh.get("weights")}
 
     def skin(self, idx=0):
         js = self.json

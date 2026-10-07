@@ -28,6 +28,7 @@ if _md not in sys.path:
 import es_step3
 import es_shaders
 import es_gltf
+import es_morph
 
 print("ES_BUILD rebind-active skeleton-consistent-ibm")
 
@@ -71,14 +72,16 @@ class Material(object):
                 bool(self.skinned), int(self.max_bones),
                 bool(self.bind_pose))
 
-    def shader_name(self):
+    def shader_name(self, morph=0):
+        # `morph` = active shape-key slot count; only split models with
+        # an atlas pass it (their shaders declare tex0/u_sw*).
         try:
             return es_shaders.get_variant(
                 specular=self.specular, normal_viz=self.normal_viz,
                 shininess=self.shininess, ambient=self.ambient,
                 diffuse=self.diffuse, spec_weight=self.spec_weight,
                 skinned=self.skinned, max_bones=self.max_bones,
-                bind_pose=self.bind_pose)
+                bind_pose=self.bind_pose, morph=morph)
         except Exception:
             return es_shaders.ensure_fallback()
 
@@ -370,7 +373,18 @@ class SkinnedObject(Object3D):
         super(SkinnedObject, self).__init__(size, speed, tilt, material)
         self.skel = Skeleton(gltf)
         self.splits = []
+        # Shape keys: name -> weight (active set), union of pool names.
+        self.shapes = {}
+        self.shape_names = []
+        self._shape_seen = set()
         self._build_splits(gltf, target)
+
+    def set_shape(self, name, weight):
+        """Set a shape key weight (typically 0..1). Names unknown to
+        every morph-capable pool are dropped silently (per-mesh name
+        sets differ)."""
+        if name in self._shape_seen:
+            self.shapes[name] = float(weight)
 
     def _build_splits(self, gltf, target):
         import es_gltf
@@ -389,7 +403,8 @@ class SkinnedObject(Object3D):
             wts = gltf.read_accessor(p["weights"], normalize=True)
             m = (world[p["nodes"][0]] if p["nodes"]
                  else es_gltf.mat4_identity())
-            prims.append((pos, nor, idx, jts, wts, m, p["material"]))
+            prims.append((pos, nor, idx, jts, wts, m, p["material"],
+                          p.get("targets"), p.get("target_names")))
             for v in pos:
                 wv = es_gltf.mat4_transform_point(m, v)
                 for k in range(3):
@@ -408,7 +423,7 @@ class SkinnedObject(Object3D):
         # into one pool, then joint-split each pool. Fewer state changes
         # per material, and a home for future per-material maps.
         pools = {}
-        for pos, nor, idx, jts, wts, m, mat in prims:
+        for pos, nor, idx, jts, wts, m, mat, tg, tnm in prims:
             v = [((es_gltf.mat4_transform_point(m, p)[0] - center[0]) * scale,
                   (es_gltf.mat4_transform_point(m, p)[1] - center[1]) * scale,
                   (es_gltf.mat4_transform_point(m, p)[2] - center[2]) * scale)
@@ -419,7 +434,14 @@ class SkinnedObject(Object3D):
                 n.append(es_gltf.mat4_transform_dir(
                     m, (nn[0] / l, nn[1] / l, nn[2] / l)))
             pool = pools.setdefault(mat, {"v": [], "n": [], "t": [],
-                                           "jj": [], "ww": []})
+                                          "jj": [], "ww": []})
+            if "mp" not in pool:
+                # Morph source for this pool: (node matrix, targets,
+                # target names). Merged multi-primitive pools clear it
+                # below -- shared atlas rows would be ambiguous.
+                pool["mp"] = (m, tg, tnm)
+            else:
+                pool["mp"] = None
             base = len(pool["v"])
             pool["v"].extend(v)
             pool["n"].extend(n)
@@ -433,6 +455,25 @@ class SkinnedObject(Object3D):
         for mat, pool in sorted(pools.items(), key=lambda kv: str(kv[0])):
             v, n, tris, jj, ww = (pool["v"], pool["n"], pool["t"],
                                  pool["jj"], pool["ww"])
+            # One RGBA8 atlas per pool: deltas in buffer space (fit scale
+            # + Y-flip applied here, same as the base vertex copy).
+            morph = None
+            mp = pool.get("mp")
+            if mp and mp[1] and mp[2]:
+                morph = es_morph.build(gltf, mp[0], mp[1], mp[2],
+                                       len(v), scale)
+                if morph is not None:
+                    es_morph.attach(morph)
+            if morph is not None:
+                for nm in morph["names"]:
+                    if nm not in self._shape_seen:
+                        self._shape_seen.add(nm)
+                        self.shape_names.append(nm)
+                print("ES_MORPH shapes=%d verts=%d atlas=%dx%d "
+                      "mscale=%.5f nscale=%.5f" % (
+                          morph["nshapes"], morph["nverts"],
+                          morph["width"], morph["height"],
+                          morph["mscale"], morph["nscale"]))
             for sub_tris, local in es_gltf.split_by_joints(tris, jj, ww, cap):
                 used = set()
                 for tri in sub_tris:
@@ -443,11 +484,16 @@ class SkinnedObject(Object3D):
                 sn = [None] * len(order)
                 sj = [None] * len(order)
                 sw = [None] * len(order)
+                svid = [None] * len(order)
                 for g, l in remap.items():
                     # Y-flip (glTF Y-up -> screen Y-down) baked here; joint
                     # matrices get the conjugate flip at palette time.
                     sv[l] = (s + v[g][0], s - v[g][1], v[g][2])
                     sn[l] = (n[g][0], -n[g][1], n[g][2])
+                    # Pool-local vertex id: indexes the morph atlas rows
+                    # exactly like the base vertex list above. 1-tuple:
+                    # mesh3_from_layout iterates each group's frame value.
+                    svid[l] = (float(g),)
                     # Нулевые веса ссылаются на кости вне палитры —
                     # им все равно какой индекс (вклад нулевой).
                     _loc = set(local)
@@ -458,10 +504,11 @@ class SkinnedObject(Object3D):
                     sw[l] = ww[g]
                 st = [tuple(remap[x] for x in tri) for tri in sub_tris]
                 mesh = es_step3.mesh3_from_layout(
-                    sv, [sj, sw, sn], st,
-                    [("a_joints", 4), ("a_weights", 4), ("a_norm3", 3)])
+                    sv, [sj, sw, sn, svid], st,
+                    [("a_joints", 4), ("a_weights", 4), ("a_norm3", 3),
+                     ("a_vid", 1)])
                 self.splits.append({"mesh": mesh, "palette": local,
-                                    "model": None})
+                                    "model": None, "morph": morph})
         # FIT-преобразование буфер<->rig: P_buf = FIT * X * FITINV,
         # где X = update() (уже W * ibm слитно). Отдельного Q не нужно:
         # worlds[] из update() уже содержит W*ibm, домножать ibm еще
@@ -500,14 +547,34 @@ class SkinnedView(Displayable):
         self.models = []
         self._identity = None
         self._splits = obj.splits
+        _dbg_seen = [False]
         for sp in obj.splits:
             m = renpy.display.model.Model(size=(obj.size, obj.size))
             m.shader("renpy.geometry")
-            m.shader(obj.material.shader_name())
+            mm = sp["morph"]
+            # Only atlas-carrying splits get the morph program: it alone
+            # declares tex0/u_sw* (draw() raises on unset uniforms).
+            _shname = obj.material.shader_name(
+                morph=(es_morph.SLOTS if mm is not None else 0))
+            m.shader(_shname)
+            if mm is not None and not _dbg_seen[0]:
+                _dbg_seen[0] = True
+                print("ES_DBG_VIEW size=%.0f shader=%s mscale=%.4f "
+                      "nverts=%d shapes=%d seen=%d" % (
+                          obj.size, _shname, mm["mscale"], mm["nverts"],
+                          len(obj.shape_names), len(obj._shape_seen)))
             # Без личного depth: общий клеар — на родителе (см. render),
             # иначе каждый сплит чистит буфер и рушит окклюзию соседей.
             m.uniform("u_view_dir", Object3D.view_dir)
             m.uniform("u_base_color", obj.material.base_color)
+            if mm is not None:
+                # Atlas must be texture 0: its sampler is named tex0.
+                m.texture(mm["displayable"])
+                m.uniform("u_mscale", mm["mscale"])
+                m.uniform("u_nscale", mm["nscale"])
+                m.uniform("u_nv", float(mm["nverts"]))
+                m.uniform("u_as",
+                          (float(mm["width"]), float(mm["height"])))
             m._mesh = sp["mesh"]
             sp["model"] = m
             self.models.append(m)
@@ -545,6 +612,27 @@ class SkinnedView(Displayable):
                 m.uniform("u_bone%d" % li, self._identity)
             m.uniform("u_spin", obj.angle)
             m.uniform("u_light_dir", light)
+            mm = sp["morph"]
+            if mm is not None:
+                # Active (row, weight) pairs for this pool's atlas,
+                # padded to the declared slot count like u_bone* above.
+                row = mm["row"]
+                slots = []
+                for nm, wt in obj.shapes.items():
+                    r = row.get(nm)
+                    if r is not None and wt:
+                        slots.append((r, float(wt)))
+                slots.sort()
+                slots = slots[:es_morph.SLOTS]
+                if not getattr(self, "_dbg_slots", False) and slots:
+                    self._dbg_slots = True
+                    print("ES_DBG_SLOTS %.1f size=%.0f %r" % (
+                        st, obj.size, slots))
+                for k in range(es_morph.SLOTS):
+                    if k < len(slots):
+                        m.uniform("u_sw%d" % k, slots[k])
+                    else:
+                        m.uniform("u_sw%d" % k, (0.0, 0.0))
         rv = renpy.display.render.Render(int(obj.size), int(obj.size))
         # Один depth-клеар на всех соседей: draw() чистит буфер в узле
         # с property depth и ставит has_depth наследникам — сплиты делят

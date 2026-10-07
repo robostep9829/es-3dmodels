@@ -100,6 +100,85 @@ float es_sx = sin(radians(25.0));
 float es_cx = cos(radians(25.0));
 """
 
+# --- Shape-key (morph target) variant -----------------------------------
+# Skin AFTER morphing (Godot's order): deltas land in bind space, the
+# palette then rotates them with the base. Names must appear verbatim in
+# vertex_200 or ShaderPart drops the declaration (gl2shadercache.py).
+
+_SKIN_BLEND_MORPH = """
+mat4 es_sm = es_pick_%(n)d(a_joints.x) * a_weights.x;
+es_sm += es_pick_%(n)d(a_joints.y) * a_weights.y;
+es_sm += es_pick_%(n)d(a_joints.z) * a_weights.z;
+es_sm += es_pick_%(n)d(a_joints.w) * a_weights.w;
+vec3 skP = (es_sm * vec4(a_position.xyz + es_dp, 1.0)).xyz;
+vec3 skN = mat3(es_sm) * (a_norm3 + es_dn);
+"""
+
+_SKIN_IDENTITY_MORPH = """
+vec3 skP = a_position.xyz + es_dp;
+vec3 skN = a_norm3 + es_dn;
+"""
+
+
+def _morph_vars(k):
+    # Declared via `variables` (not vertex_functions): these names occur
+    # inline in the vertex_200 body, which is exactly what ShaderPart
+    # requires to keep a declaration. Leading newline: ShaderPart parses
+    # `variables` line-by-line and raises on any line that is not exactly
+    # "{uniform,attribute,vertex} {type} {name}" -- the preceding
+    # _skin_decls block ends with ';' and no newline.
+    lines = ["uniform sampler2D tex0;",
+             "uniform float u_mscale;",
+             "uniform float u_nscale;",
+             "uniform float u_nv;",
+             "uniform vec2 u_as;",
+             "attribute float a_vid;"]
+    for i in range(k):
+        lines.append("uniform vec2 u_sw%d;" % i)
+    return "\n" + "\n".join(lines) + "\n"
+
+
+def _morph_funcs():
+    # Pre-declaration section: must not reference uniforms (functions
+    # are emitted before `variables`; sizes come in as arguments).
+    return """
+float es_b(float x) {
+  return floor(x * 255.0 + 0.5);
+}
+float es_d(float hi, float lo) {
+  return (es_b(hi) * 255.0 + es_b(lo)) / 65535.0 * 2.0 - 1.0;
+}
+vec2 es_uv(float es_i, vec2 es_sz) {
+  return vec2(mod(es_i, es_sz.x) + 0.5, floor(es_i / es_sz.x) + 0.5) / es_sz;
+}
+"""
+
+
+def _morph_body(k):
+    # Unrolled active-shape slots (Ren'Py cannot bind uniform arrays,
+    # gl2shader.pyx find_variables rejects them). Zero weight exits
+    # before any texture fetch. u_sw.x = local row, u_sw.y = weight.
+    out = ["vec3 es_dp = vec3(0.0);",
+           "vec3 es_dn = vec3(0.0);"]
+    slot = """
+if (u_sw%(i)d.y != 0.0) {
+  float es_f%(i)d = (floor(u_sw%(i)d.x) * u_nv + a_vid) * 4.0;
+  vec4 es_a%(i)d = texture2D(tex0, es_uv(es_f%(i)d, u_as));
+  vec4 es_b%(i)d = texture2D(tex0, es_uv(es_f%(i)d + 1.0, u_as));
+  vec4 es_c%(i)d = texture2D(tex0, es_uv(es_f%(i)d + 2.0, u_as));
+  vec4 es_e%(i)d = texture2D(tex0, es_uv(es_f%(i)d + 3.0, u_as));
+  es_dp += vec3(es_d(es_a%(i)d.r, es_a%(i)d.g),
+                es_d(es_a%(i)d.b, es_b%(i)d.r),
+                es_d(es_b%(i)d.g, es_b%(i)d.b)) * (u_mscale * u_sw%(i)d.y);
+  es_dn += vec3(es_d(es_c%(i)d.r, es_c%(i)d.g),
+                es_d(es_c%(i)d.b, es_e%(i)d.r),
+                es_d(es_e%(i)d.g, es_e%(i)d.b)) * (u_nscale * u_sw%(i)d.y);
+}
+"""
+    for i in range(k):
+        out.append(slot % {"i": i})
+    return "\n".join(out) + "\n"
+
 _FRAG_BLINN = """
 vec3 N = normalize(v_normal);
 vec3 H = normalize(v_half);
@@ -163,11 +242,19 @@ def _skin_pick(n):
 
 def get_variant(specular=True, normal_viz=False, shininess=16.0,
                 ambient=0.3, diffuse=0.7, spec_weight=0.5,
-                skinned=False, max_bones=24, bind_pose=False):
-    """Return a registered shader name for this feature combination."""
+                skinned=False, max_bones=24, bind_pose=False,
+                morph=0):
+    """Return a registered shader name for this feature combination.
+
+    `morph` is the number of active shape-key slots (0 = no morphs).
+    Morphs need the skinned path (a_vid lives in the split layout);
+    ignored for rigid variants."""
+    if not skinned:
+        morph = 0
+    morph = max(0, int(morph))
     key = (bool(specular), bool(normal_viz), float(shininess),
            float(ambient), float(diffuse), float(spec_weight),
-           bool(skinned), int(max_bones), bool(bind_pose))
+           bool(skinned), int(max_bones), bool(bind_pose), morph)
     if key in VARIANTS:
         return VARIANTS[key]
     if normal_viz:
@@ -179,23 +266,28 @@ def get_variant(specular=True, normal_viz=False, shininess=16.0,
                                   "spec_weight": float(spec_weight)}
     else:
         fragment = _FRAG_LAMBERT % {"ambient": float(ambient),
-                                   "diffuse": float(diffuse)}
+                                    "diffuse": float(diffuse)}
     variables = _VARIABLES
     vfuncs = ""
+    prelude = ""
     if skinned:
         n = max(1, int(max_bones))
         variables = variables + (_NORMAL_DECL % "a_norm3")
         variables = variables + _skin_decls(n)
         vfuncs = _skin_pick(n)
+        if morph:
+            variables = variables + _morph_vars(morph)
+            vfuncs = vfuncs + _morph_funcs()
+            prelude = _morph_body(morph)
         if bind_pose:
-            vertex = (_SKIN_IDENTITY + "\n" +
-                      _VERTEX_SPIN + _VERTEX)
+            skin = (_SKIN_IDENTITY_MORPH if morph else _SKIN_IDENTITY)
         else:
-            vertex = ((_SKIN_BLEND % {"n": n}) + "\n" +
-                      _VERTEX_SPIN + _VERTEX)
+            skin = ((_SKIN_BLEND_MORPH if morph else _SKIN_BLEND)
+                    % {"n": n})
     else:
         variables = variables + (_NORMAL_DECL % "a_normal")
-        vertex = _VERTEX_RIGID + "\n" + _VERTEX_SPIN + _VERTEX
+        skin = _VERTEX_RIGID
+    vertex = prelude + skin + "\n" + _VERTEX_SPIN + _VERTEX
     # v3 namespace + process salt: a name is never reused across a source
     # change OR a process boundary, so no stale compile can ever be served.
     name = "es_mat3_%s_%s" % (
