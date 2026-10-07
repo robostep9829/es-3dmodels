@@ -3,17 +3,6 @@
 How the shape-key system is verified without touching your desktop.
 One command = one approval = a complete test cycle.
 
-## Layout
-
-| Path | Purpose |
-|---|---|
-| `/tmp/opencode/es_morphtest/` | standalone harness game (own `game/script.rpy`, screenshots land here) |
-| `/tmp/opencode/run_morphtest.sh` | runner: boots game, waits for shot files, kills it, prints tail |
-| `/tmp/opencode/es_run.out` | full stdout of last run (all `ES_*` markers) |
-| `shotM0..M3.png`, `shotN0..N7.png` | scripted screenshots |
-| `/tmp/opencode/head_*.png`, `cmp_*.png` | crops/diffs generated during analysis |
-| `/tmp/opencode/analyze_*.py` | pixel-metric scripts (run with system `python3` + PIL) |
-
 ## How the environment was built ("SDK extraction")
 
 No SDK was downloaded — a shipped Ren'Py game already contains the whole
@@ -34,20 +23,20 @@ Construction steps:
    the runner does):
    ```bash
    cd "<game root>"
-   lib/linux-x86_64/python "Everlasting Summer.py" /tmp/opencode/es_morphtest \
-       > /tmp/opencode/es_run.out 2>&1 &
+   lib/linux-x86_64/python "Everlasting Summer.py" <scratch_project> \
+       > <run_log> 2>&1 &
    ```
    Same GL2 renderer and `librenpython.so` as the real game — nothing
    installed, nothing written back to the game dir.
 
-2. **Minimal skeleton**: `/tmp/opencode/es_morphtest/` holds only
+2. **Minimal skeleton**: the scratch project holds only
    `game/script.rpy`. The engine creates `cache/`, `saves/`, `log.txt`,
    `traceback.txt`, `game/script.rpyc` beside it. The bare project has
    no screens (`Layout.yesno_prompt` missing) → hence
    `config.quit_action = None`.
 
 3. **Symlink the mod in, never copy it**:
-   `es_morphtest/game/mods/es-3dmodels → <real>/game/mods/es-3dmodels`.
+   `<scratch>/game/mods/es-3dmodels → <real>/game/mods/es-3dmodels`.
    `renpy.script.scan_script_files()` walks the whole basedir
    (`renpy.loader.listdirfiles`), so the mod's real `es-3dmodels.rpy`
    parses and runs inside the harness (proven by `ES_NOD start`), and
@@ -61,12 +50,12 @@ Construction steps:
    mod registry before the mod's `init:` (priority 0) writes
    `mods["es_3dmodels"] = ...`.
 
-5. **Self-driving script**: `script.rpy` puts the mod dir on `sys.path`,
+5. **Self-driving script**: the scratch script puts the mod dir on `sys.path`,
    imports `es_engine`, screenshots to an absolute `OUTDIR`, and
    sequences phases with `pause` + file-driven runner waits. The only
    input is the runner's single Return at the menu.
 
 6. **Offline metrics use a different interpreter**: pixel checks run
-   under system `python3` + PIL (`analyze_*.py`); the bundled CPython
+   under system `python3` + PIL; the bundled CPython
    has no PIL and no `runpy`.
 
