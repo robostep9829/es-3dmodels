@@ -29,9 +29,8 @@ exactly as the split vertex copy does.
 """
 import es_gltf
 
-# Simultaneous active shapes per draw. Editable: regenerates one shader
-# variant (u_sw0..u_sw{SLOTS-1} + the same number of unrolled fetches).
-SLOTS = 32
+# Simultaneous active shapes per draw ("slots", u_sw0..u_sw{N-1} +
+# the same number of unrolled fetches) are decided by es_caps.
 
 ATLAS_WIDTH = 2048
 TEXELS = 4

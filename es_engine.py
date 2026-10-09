@@ -29,6 +29,7 @@ import es_step3
 import es_shaders
 import es_gltf
 import es_morph
+import es_caps
 
 print("ES_BUILD rebind-active skeleton-consistent-ibm")
 
@@ -52,7 +53,7 @@ class Material(object):
                  light_dir=None,
                  shininess=16.0, ambient=0.3, diffuse=0.7,
                  spec_weight=0.5, specular=True, normal_viz=False,
-                 skinned=False, max_bones=24, bind_pose=False):
+                 skinned=False, max_bones=None, bind_pose=False):
         self.base_color = base_color
         self.light_dir = light_dir
         self.shininess = shininess
@@ -62,7 +63,9 @@ class Material(object):
         self.specular = specular
         self.normal_viz = normal_viz
         self.skinned = skinned
-        self.max_bones = max_bones
+        # None = decide from hardware (es_caps); lazy probe, label-time.
+        self.max_bones = (max_bones if max_bones is not None
+                          else es_caps.max_bones())
         self.bind_pose = bind_pose
 
     def variant_key(self):
@@ -363,7 +366,7 @@ class SkinnedObject(Object3D):
     """glTF mesh skinned on GPU. update() poses joints, view pushes palette."""
 
     def __init__(self, gltf, size=600.0, speed=30.0, tilt=25.0,
-                 color=(0.85, 0.8, 0.75), max_bones=24, target=300.0):
+                 color=(0.85, 0.8, 0.75), max_bones=None, target=300.0):
         import es_gltf
         if isinstance(gltf, basestring):
             gltf = es_gltf.Gltf.load(gltf)
@@ -459,7 +462,8 @@ class SkinnedObject(Object3D):
             # + Y-flip applied here, same as the base vertex copy).
             morph = None
             mp = pool.get("mp")
-            if mp and mp[1] and mp[2]:
+            # morph_ok: vertex texture fetch / uniform budget must exist.
+            if mp and mp[1] and mp[2] and es_caps.morph_ok():
                 morph = es_morph.build(gltf, mp[0], mp[1], mp[2],
                                        len(v), scale)
                 if morph is not None:
@@ -469,6 +473,7 @@ class SkinnedObject(Object3D):
                     if nm not in self._shape_seen:
                         self._shape_seen.add(nm)
                         self.shape_names.append(nm)
+                es_caps.check_atlas(morph["width"], morph["height"])
                 print("ES_MORPH shapes=%d verts=%d atlas=%dx%d "
                       "mscale=%.5f nscale=%.5f" % (
                           morph["nshapes"], morph["nverts"],
@@ -543,6 +548,7 @@ class SkinnedView(Displayable):
 
     def __init__(self, obj, **kwargs):
         super(SkinnedView, self).__init__(**kwargs)
+        es_caps.ensure()
         self.obj = obj
         self.models = []
         self._identity = None
@@ -555,7 +561,7 @@ class SkinnedView(Displayable):
             # Only atlas-carrying splits get the morph program: it alone
             # declares tex0/u_sw* (draw() raises on unset uniforms).
             _shname = obj.material.shader_name(
-                morph=(es_morph.SLOTS if mm is not None else 0))
+                morph=(es_caps.slots() if mm is not None else 0))
             m.shader(_shname)
             if mm is not None and not _dbg_seen[0]:
                 _dbg_seen[0] = True
@@ -623,12 +629,12 @@ class SkinnedView(Displayable):
                     if r is not None and wt:
                         slots.append((r, float(wt)))
                 slots.sort()
-                slots = slots[:es_morph.SLOTS]
+                slots = slots[:es_caps.slots()]
                 if not getattr(self, "_dbg_slots", False) and slots:
                     self._dbg_slots = True
                     print("ES_DBG_SLOTS %.1f size=%.0f %r" % (
                         st, obj.size, slots))
-                for k in range(es_morph.SLOTS):
+                for k in range(es_caps.slots()):
                     if k < len(slots):
                         m.uniform("u_sw%d" % k, slots[k])
                     else:
