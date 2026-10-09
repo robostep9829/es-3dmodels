@@ -9,7 +9,9 @@ Proven rules this encodes (see project history):
 - rotation lives in the model matrix (auto-centered pivot), never in verts,
 - Mesh3 fields are cdef-only: uploads go through es_step3's poked offsets,
 - depth test needs the direct-draw path: show WITHOUT dissolve,
-- normals rotate analytically in-shader (u_transform collapses them).
+- normals rotate analytically in-shader (u_transform collapses them),
+- the bone palette composes in buffer (FIT) space: conjugation distributes
+  over the joint chain, so FIT rides on bind constants, never per frame.
 """
 import os
 import sys
@@ -21,25 +23,27 @@ import renpy.display.matrix
 from renpy.display.core import Displayable
 from renpy.display.transform import Transform
 
-_md = os.path.dirname(renpy.loader.transfn("mods/es-3dmodels/es_engine.py"))
-if _md not in sys.path:
-    sys.path.insert(0, _md)
+_mod_dir = os.path.dirname(
+    renpy.loader.transfn("mods/es-3dmodels/es_engine.py"))
+if _mod_dir not in sys.path:
+    sys.path.insert(0, _mod_dir)
 
 import es_step3
 import es_shaders
 import es_gltf
+import es_obj
 import es_morph
 import es_caps
 
-print("ES_BUILD rebind-active skeleton-consistent-ibm")
+print("ES_BUILD fit-space-palette")
+
+_Matrix = renpy.display.matrix.Matrix
 
 
 def es_gltf_bind(path, target=300.0):
     """Load a .gltf/.glb bind pose: (verts, normals, tris), fit to target."""
     return es_gltf.bind_pose_mesh(es_gltf.Gltf.load(path), target)
-import es_obj
 
-_Matrix = renpy.display.matrix.Matrix
 
 # Global scene light. Materials with light_dir=None follow this;
 # a per-material light_dir overrides it for that object only.
@@ -121,9 +125,9 @@ class Object3D(object):
 
     def centered(self):
         """Mesh-space verts with the object centered in its box."""
-        s = self.size / 2.0
-        return ([(s + x, s + y, z) for (x, y, z) in self.verts],
-                list(self.normals), list(self.tris))
+        half_size = self.size / 2.0
+        verts = [(half_size + x, half_size + y, z) for (x, y, z) in self.verts]
+        return verts, list(self.normals), list(self.tris)
 
     def build_mesh(self):
         v, n, t = self.centered()
@@ -201,14 +205,14 @@ class ObjectView(Displayable):
         if key == self._shader_key and self.model is not None:
             return
         self._shader_key = key
-        m = renpy.display.model.Model(size=(self.obj.size, self.obj.size))
-        m.shader("renpy.geometry")
-        m.shader(self.obj.material.shader_name())
-        m.property("depth", True)
-        m.uniform("u_view_dir", Object3D.view_dir)
-        m.uniform("u_base_color", self.obj.material.base_color)
-        m._mesh = self.obj.mesh
-        self.model = m
+        model = renpy.display.model.Model(size=(self.obj.size, self.obj.size))
+        model.shader("renpy.geometry")
+        model.shader(self.obj.material.shader_name())
+        model.property("depth", True)
+        model.uniform("u_view_dir", Object3D.view_dir)
+        model.uniform("u_base_color", self.obj.material.base_color)
+        model._mesh = self.obj.mesh
+        self.model = model
 
     def render(self, w, h, st, at):
         obj = self.obj
@@ -222,7 +226,7 @@ class ObjectView(Displayable):
             "u_light_dir",
             obj.material.light_dir if obj.material.light_dir is not None
             else LIGHT_DIR)
-        inner = Transform(
+        turntable = Transform(
             self.model,
             matrixtransform=_Matrix.rotate(obj.tilt, obj.angle, 0.0),
             perspective=True)
@@ -235,93 +239,132 @@ class ObjectView(Displayable):
             # а uniform'ы — скопированные значения Render.)
             renpy.display.render.redraw(self, 0.016)
             renpy.display.render.redraw(self.model, 0.016)
-        return renpy.display.render.render(inner, w, h, st, at)
+        return renpy.display.render.render(turntable, w, h, st, at)
 
 
 class Skeleton(object):
     """Joint hierarchy + bind pose + procedural overrides.
 
-    Composes world matrices per frame on CPU (215 joints = milliseconds);
+    Composes skinning matrices per frame on CPU (215 joints = milliseconds);
     per-vertex deformation runs on GPU from the resulting palette.
+
+    update() answers in the mesh's buffer space -- the one _fit_transforms
+    describes. Conjugation distributes over the hierarchy
+    (FIT*(A*B)*FIT^-1 == FIT*A*FIT^-1 * FIT*B*FIT^-1), so use_fit_space()
+    folds FIT into the node and inverse-bind constants once and no frame
+    ever conjugates again.
     """
 
     def __init__(self, gltf, skin_idx=0):
         import es_gltf
         self.gltf = gltf
-        sk = gltf.skin(skin_idx)
-        self.joint_nodes = list(sk["joints"])
-        self.inverse_bind = [tuple(tuple(r) for r in m)
-                             for m in sk["inverse_bind"]]
-        self.names = [gltf.json["nodes"][ni].get("name", "j%d" % k)
-                      for k, ni in enumerate(self.joint_nodes)]
-        children = gltf.children()
-        parent = {}
-        for pi, ch in enumerate(children):
-            for c in ch:
-                parent[c] = pi
-        order = []
-        seen = set()
+        skin = gltf.skin(skin_idx)
+        self.joint_nodes = list(skin["joints"])
+        self.joint_names = [gltf.json["nodes"][ni].get("name", "j%d" % k)
+                            for k, ni in enumerate(self.joint_nodes)]
+        node_count = len(gltf.json.get("nodes", []))
+        self.node_parent = {}
+        for parent_index, kids in enumerate(gltf.children()):
+            for kid in kids:
+                self.node_parent[kid] = parent_index
+        self.node_order = []
+        visited = set()
 
-        def visit(ni):
-            if ni in seen:
+        def visit(node_index):
+            if node_index in visited:
                 return
-            if ni in parent:
-                visit(parent[ni])
-            seen.add(ni)
-            order.append(ni)
+            if node_index in self.node_parent:
+                visit(self.node_parent[node_index])
+            visited.add(node_index)
+            self.node_order.append(node_index)
 
-        for ni in range(len(gltf.json.get("nodes", []))):
-            visit(ni)
-        self.order = order
-        self.parent = parent
-        self.base_local = {}
-        for ni in range(len(gltf.json.get("nodes", []))):
-            kind = gltf.node_local(ni)
-            if kind[0] == "matrix":
-                self.base_local[ni] = ("matrix", kind[1])
-            else:
-                self.base_local[ni] = ("trs", kind[1], kind[2], kind[3])
-        # overrides: node idx -> ("quat", (x,y,z,w)) replacing rotation
-        self.overrides = {}
-        self.worlds = {}
-        # Rebind: the file's inverse-bind matches a different node pose
-        # than the file's node TRS (retopo asset). Rest = node-defined
-        # bind (matches the rigid demos), so invert THOSE worlds.
-        _bind = {}
-        for ni in self.order:
-            if ni in self.parent:
-                _bind[ni] = es_gltf.mat4_mul(
-                    _bind[self.parent[ni]], self._local_of(ni, {}))
-            else:
-                _bind[ni] = self._local_of(ni, {})
-        self.inverse_bind = [
-            es_gltf.mat4_inverse(_bind[ni]) for ni in self.joint_nodes]
-
-    def _local_of(self, ni, overrides):
-        import es_gltf
-        spec = self.base_local[ni]
-        if ni in overrides:
-            _, q = overrides[ni]
+        for node_index in range(node_count):
+            visit(node_index)
+        # A node carries either a matrix or TRS in the file; keep both shapes.
+        self.local_specs = {}
+        for node_index in range(node_count):
+            spec = gltf.node_local(node_index)
             if spec[0] == "matrix":
-                return spec[1]
-            _, t, _r, s = spec
-            return es_gltf.mat4_trs(t, q, s)
+                self.local_specs[node_index] = ("matrix", spec[1])
+            else:
+                self.local_specs[node_index] = ("trs",
+                                                 spec[1], spec[2], spec[3])
+        # Procedural posing: node index -> (x, y, z, w) replacing its rotation.
+        self.rotation_overrides = {}
+        # Rebind: the file's inverseBindMatrices match a different node pose
+        # than the file's node TRS (retopo asset). The rest pose the NODES
+        # define is what the rigid demos render, so invert THOSE worlds.
+        bind_world = {}
+        for node_index in self.node_order:
+            local = self._rest_local(node_index)
+            parent = self.node_parent.get(node_index)
+            if parent is None:
+                bind_world[node_index] = local
+            else:
+                bind_world[node_index] = es_gltf.mat4_mul(
+                    bind_world[parent], local)
+        self.inverse_bind = [
+            es_gltf.mat4_inverse(bind_world[ni]) for ni in self.joint_nodes]
+        # Fit-space constants. SkinnedObject._build_splits supplies the fit
+        # once it has measured the mesh; use_fit_space() must have run before
+        # update().
+        self.fit = None
+        self.fit_inverse = None
+        self.local_fit = {}
+        self.inverse_bind_fit = []
+
+    def use_fit_space(self, fit, fit_inverse):
+        """Fold the mesh's fit transform into every constant matrix.
+
+        Called once by SkinnedObject._build_splits, which owns the scale,
+        center and pivot mapping rig space onto the vertex buffer. This pays
+        for the conjugations the palette used to redo per frame and per slot.
+        """
+        self.fit = fit
+        self.fit_inverse = fit_inverse
+        self.local_fit = {}
+        for node_index in self.local_specs:
+            self.local_fit[node_index] = self._to_fit(
+                self._rest_local(node_index))
+        self.inverse_bind_fit = [self._to_fit(ibm)
+                                 for ibm in self.inverse_bind]
+
+    def _to_fit(self, matrix):
+        """Rig-space matrix -> the same transform in buffer (fit) space."""
+        import es_gltf
+        return es_gltf.mat4_mul(
+            es_gltf.mat4_mul(self.fit, matrix), self.fit_inverse)
+
+    def _rest_local(self, node_index):
+        """Node's local matrix exactly as the file defines it."""
+        import es_gltf
+        spec = self.local_specs[node_index]
         if spec[0] == "matrix":
             return spec[1]
-        _, t, r, s = spec
-        return es_gltf.mat4_trs(t, r, s)
+        _, translation, rotation, scale = spec
+        return es_gltf.mat4_trs(translation, rotation, scale)
 
-    def joint_index(self, name_or_idx):
-        if isinstance(name_or_idx, int):
-            return name_or_idx
-        return self.names.index(name_or_idx)
+    def _posed_local(self, node_index, rotation):
+        """Local matrix with `rotation` replacing the file's own."""
+        import es_gltf
+        spec = self.local_specs[node_index]
+        if spec[0] == "matrix":
+            # A matrix node has no TRS rotation to replace: not posable.
+            return spec[1]
+        _, translation, _rotation, scale = spec
+        return es_gltf.mat4_trs(translation, rotation, scale)
 
-    def pose_quat(self, name_or_idx, quat):
+    def joint_index(self, name_or_index):
+        if isinstance(name_or_index, int):
+            return name_or_index
+        return self.joint_names.index(name_or_index)
+
+    def pose_quat(self, name_or_index, quat):
         """Override a joint's local rotation (procedural posing)."""
-        ji = self.joint_index(name_or_idx)
-        self.overrides[self.joint_nodes[ji]] = ("quat", tuple(quat))
+        joint = self.joint_index(name_or_index)
+        self.rotation_overrides[self.joint_nodes[joint]] = tuple(quat)
 
-    def pose_euler(self, name_or_idx, rx=0.0, ry=0.0, rz=0.0):
+    def pose_euler(self, name_or_index, rx=0.0, ry=0.0, rz=0.0):
         import math as _m
         ax, ay, az = _m.radians(rx), _m.radians(ry), _m.radians(rz)
         cx, sx = _m.cos(ax / 2.0), _m.sin(ax / 2.0)
@@ -332,7 +375,7 @@ class Skeleton(object):
         qy = (0.0, sy, 0.0, cy)
         qz = (0.0, 0.0, sz, cz)
 
-        def mul(a, b):
+        def quat_mul(a, b):
             ax_, ay_, az_, aw_ = a
             bx_, by_, bz_, bw_ = b
             return (aw_ * bx_ + ax_ * bw_ + ay_ * bz_ - az_ * by_,
@@ -340,26 +383,63 @@ class Skeleton(object):
                     aw_ * bz_ + ax_ * by_ - ay_ * bx_ + az_ * bw_,
                     aw_ * bw_ - ax_ * bx_ - ay_ * by_ - az_ * bz_)
 
-        self.pose_quat(name_or_idx, mul(mul(qy, qx), qz))
+        self.pose_quat(name_or_index, quat_mul(quat_mul(qy, qx), qz))
 
     def update(self):
-        """Recompute world matrices. Returns {joint_idx: mat4}."""
+        """Skinning matrix per joint, in buffer space: {joint index: mat4}.
+
+        One multiply per hierarchy edge and one per joint -- FIT is already
+        folded into both factors by use_fit_space().
+        """
         import es_gltf
-        local = {}
-        for ni in self.base_local:
-            local[ni] = self._local_of(ni, self.overrides)
-        worlds = {}
-        for ni in self.order:
-            if ni in self.parent:
-                worlds[ni] = es_gltf.mat4_mul(worlds[self.parent[ni]],
-                                              local[ni])
+        local = self.local_fit
+        if self.rotation_overrides:
+            local = dict(local)
+            for node_index, rotation in self.rotation_overrides.items():
+                local[node_index] = self._to_fit(
+                    self._posed_local(node_index, rotation))
+        chain = {}
+        for node_index in self.node_order:
+            parent = self.node_parent.get(node_index)
+            if parent is None:
+                chain[node_index] = local[node_index]
             else:
-                worlds[ni] = local[ni]
-        self.worlds = worlds
-        out = {}
-        for ji, ni in enumerate(self.joint_nodes):
-            out[ji] = es_gltf.mat4_mul(worlds[ni], self.inverse_bind[ji])
-        return out
+                chain[node_index] = es_gltf.mat4_mul(chain[parent],
+                                                     local[node_index])
+        return dict(
+            (joint, es_gltf.mat4_mul(chain[node],
+                                     self.inverse_bind_fit[joint]))
+            for joint, node in enumerate(self.joint_nodes))
+
+
+def _fit_transforms(half_size, fit_scale, bounds_center):
+    """(fit, fit_inverse): rig space <-> the space the vertex buffer lives in.
+
+    fit carries a rig-space point onto the uploaded verts -- bring the bounds
+    center to the origin, scale to the target size, flip Y (glTF is Y-up, the
+    screen is Y-down), then offset by the half-size the Model draws at.
+    fit_inverse undoes the same steps in reverse order.
+    """
+    import es_gltf
+    no_rotation = (0.0, 0.0, 0.0, 1.0)
+    unit_scale = (1.0, 1.0, 1.0)
+    origin = (0.0, 0.0, 0.0)
+    pivot = (half_size, half_size, 0.0)
+    mul = es_gltf.mat4_mul
+    trs = es_gltf.mat4_trs
+    to_bounds_center = trs(tuple(-x for x in bounds_center),
+                           no_rotation, unit_scale)
+    away_from_bounds_center = trs(tuple(bounds_center),
+                                  no_rotation, unit_scale)
+    to_pivot = trs(pivot, no_rotation, unit_scale)
+    away_from_pivot = trs(tuple(-x for x in pivot), no_rotation, unit_scale)
+    enlarge = trs(origin, no_rotation, (fit_scale, fit_scale, fit_scale))
+    shrink = trs(origin, no_rotation, (1.0 / fit_scale, 1.0 / fit_scale,
+                                       1.0 / fit_scale))
+    flip_y = trs(origin, no_rotation, (1.0, -1.0, 1.0))
+    return (mul(mul(mul(to_pivot, flip_y), enlarge), to_bounds_center),
+            mul(mul(mul(away_from_bounds_center, shrink), flip_y),
+                away_from_pivot))
 
 
 class SkinnedObject(Object3D):
@@ -391,203 +471,223 @@ class SkinnedObject(Object3D):
 
     def _build_splits(self, gltf, target):
         import es_gltf
-        world = es_gltf.node_world_matrices(gltf)
-        s = self.size / 2.0
-        # fit factor shared across splits (same as bind pose)
-        all_min = [1e30, 1e30, 1e30]
-        all_max = [-1e30, -1e30, -1e30]
-        prims = []
-        for p in gltf.primitives():
-            pos = gltf.read_accessor(p["position"])
-            nor = (gltf.read_accessor(p["normal"])
-                   if p["normal"] is not None else None)
-            idx = [int(x) for x in gltf.read_accessor(p["indices"])]
-            jts = gltf.read_accessor(p["joints"])
-            wts = gltf.read_accessor(p["weights"], normalize=True)
-            m = (world[p["nodes"][0]] if p["nodes"]
-                 else es_gltf.mat4_identity())
-            prims.append((pos, nor, idx, jts, wts, m, p["material"],
-                          p.get("targets"), p.get("target_names")))
-            for v in pos:
-                wv = es_gltf.mat4_transform_point(m, v)
-                for k in range(3):
-                    if wv[k] < all_min[k]:
-                        all_min[k] = wv[k]
-                    if wv[k] > all_max[k]:
-                        all_max[k] = wv[k]
-        extent = max(all_max[k] - all_min[k] for k in range(3)) or 1.0
-        scale = target / extent
-        center = [(all_min[k] + all_max[k]) / 2.0 for k in range(3)]
+        node_world = es_gltf.node_world_matrices(gltf)
+        half_size = self.size / 2.0
+        # One fit for every split (the same numbers the bind-pose demos use),
+        # measured over all primitives so the parts stay aligned.
+        bounds_min = [1e30, 1e30, 1e30]
+        bounds_max = [-1e30, -1e30, -1e30]
+        prim_data = []
+        for prim in gltf.primitives():
+            positions = gltf.read_accessor(prim["position"])
+            normals = (gltf.read_accessor(prim["normal"])
+                       if prim["normal"] is not None else None)
+            indices = [int(x) for x in gltf.read_accessor(prim["indices"])]
+            joint_rows = gltf.read_accessor(prim["joints"])
+            weight_rows = gltf.read_accessor(prim["weights"], normalize=True)
+            node_matrix = (node_world[prim["nodes"][0]] if prim["nodes"]
+                           else es_gltf.mat4_identity())
+            prim_data.append((positions, normals, indices, joint_rows,
+                              weight_rows, node_matrix, prim["material"],
+                              prim.get("targets"), prim.get("target_names")))
+            for point in positions:
+                world_point = es_gltf.mat4_transform_point(node_matrix, point)
+                for axis in range(3):
+                    if world_point[axis] < bounds_min[axis]:
+                        bounds_min[axis] = world_point[axis]
+                    if world_point[axis] > bounds_max[axis]:
+                        bounds_max[axis] = world_point[axis]
+        extent = max(bounds_max[k] - bounds_min[k] for k in range(3)) or 1.0
+        fit_scale = target / extent
+        bounds_center = [(bounds_min[k] + bounds_max[k]) / 2.0
+                         for k in range(3)]
         print("ES_FIT nprims=%d extent=%.3f scale=%.3f center=%r size=%.1f target=%.1f" % (
-            len(prims), extent, scale,
-            tuple(round(x, 3) for x in center), self.size, target))
-        cap = self.material.max_bones
+            len(prim_data), extent, fit_scale,
+            tuple(round(x, 3) for x in bounds_center), self.size, target))
+        self.fit, self.fit_inverse = _fit_transforms(
+            half_size, fit_scale, bounds_center)
+        bone_cap = self.material.max_bones
         # Condense by material first: merge primitives sharing a material
         # into one pool, then joint-split each pool. Fewer state changes
         # per material, and a home for future per-material maps.
         pools = {}
-        for pos, nor, idx, jts, wts, m, mat, tg, tnm in prims:
-            v = [((es_gltf.mat4_transform_point(m, p)[0] - center[0]) * scale,
-                  (es_gltf.mat4_transform_point(m, p)[1] - center[1]) * scale,
-                  (es_gltf.mat4_transform_point(m, p)[2] - center[2]) * scale)
-                 for p in pos]
-            n = []
-            for k, nn in enumerate(nor or [(0.0, 0.0, 1.0)] * len(pos)):
-                l = (nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]) ** 0.5 or 1.0
-                n.append(es_gltf.mat4_transform_dir(
-                    m, (nn[0] / l, nn[1] / l, nn[2] / l)))
-            pool = pools.setdefault(mat, {"v": [], "n": [], "t": [],
-                                          "jj": [], "ww": []})
-            if "mp" not in pool:
+        for (positions, normals, indices, joint_rows, weight_rows,
+             node_matrix, material_id,
+             morph_targets, morph_names) in prim_data:
+            verts = []
+            for point in positions:
+                world_point = es_gltf.mat4_transform_point(node_matrix, point)
+                verts.append(((world_point[0] - bounds_center[0]) * fit_scale,
+                              (world_point[1] - bounds_center[1]) * fit_scale,
+                              (world_point[2] - bounds_center[2]) * fit_scale))
+            unit_normals = []
+            for normal in (normals or [(0.0, 0.0, 1.0)] * len(positions)):
+                length = ((normal[0] * normal[0] + normal[1] * normal[1]
+                           + normal[2] * normal[2]) ** 0.5) or 1.0
+                unit_normals.append(es_gltf.mat4_transform_dir(
+                    node_matrix, (normal[0] / length, normal[1] / length,
+                                  normal[2] / length)))
+            pool = pools.setdefault(material_id, {
+                "verts": [], "normals": [], "tris": [],
+                "joints": [], "weights": []})
+            if "morph_source" not in pool:
                 # Morph source for this pool: (node matrix, targets,
                 # target names). Merged multi-primitive pools clear it
                 # below -- shared atlas rows would be ambiguous.
-                pool["mp"] = (m, tg, tnm)
+                pool["morph_source"] = (node_matrix, morph_targets,
+                                        morph_names)
             else:
-                pool["mp"] = None
-            base = len(pool["v"])
-            pool["v"].extend(v)
-            pool["n"].extend(n)
-            pool["jj"].extend([tuple(int(x) for x in row) for row in jts])
-            pool["ww"].extend([tuple(float(x) for x in row) for row in wts])
-            pool["t"].extend([tuple(base + x for x in idx[k:k + 3])
-                              for k in range(0, len(idx), 3)])
+                pool["morph_source"] = None
+            first_vert = len(pool["verts"])
+            pool["verts"].extend(verts)
+            pool["normals"].extend(unit_normals)
+            pool["joints"].extend([tuple(int(x) for x in row)
+                                   for row in joint_rows])
+            pool["weights"].extend([tuple(float(x) for x in row)
+                                    for row in weight_rows])
+            pool["tris"].extend(
+                [tuple(first_vert + x for x in indices[k:k + 3])
+                 for k in range(0, len(indices), 3)])
         print("ES_MATS groups=%d tris=%r" % (
             len(pools),
-            sorted([(mat, len(p["t"])) for mat, p in pools.items()])))
-        for mat, pool in sorted(pools.items(), key=lambda kv: str(kv[0])):
-            v, n, tris, jj, ww = (pool["v"], pool["n"], pool["t"],
-                                 pool["jj"], pool["ww"])
+            sorted([(material_id, len(pool["tris"]))
+                    for material_id, pool in pools.items()])))
+        ordered_pools = sorted(pools.items(), key=lambda kv: str(kv[0]))
+        for material_id, pool in ordered_pools:
+            verts = pool["verts"]
+            normals = pool["normals"]
+            tris = pool["tris"]
+            joint_rows = pool["joints"]
+            weight_rows = pool["weights"]
             # One RGBA8 atlas per pool: deltas in buffer space (fit scale
             # + Y-flip applied here, same as the base vertex copy).
             morph = None
-            mp = pool.get("mp")
+            morph_source = pool.get("morph_source")
             # morph_ok: vertex texture fetch / uniform budget must exist.
-            if mp and mp[1] and mp[2] and es_caps.morph_ok():
-                morph = es_morph.build(gltf, mp[0], mp[1], mp[2],
-                                       len(v), scale)
+            if (morph_source and morph_source[1] and morph_source[2]
+                    and es_caps.morph_ok()):
+                morph = es_morph.build(gltf, morph_source[0], morph_source[1],
+                                       morph_source[2], len(verts), fit_scale)
                 if morph is not None:
                     es_morph.attach(morph)
             if morph is not None:
-                for nm in morph["names"]:
-                    if nm not in self._shape_seen:
-                        self._shape_seen.add(nm)
-                        self.shape_names.append(nm)
+                for shape_name in morph["names"]:
+                    if shape_name not in self._shape_seen:
+                        self._shape_seen.add(shape_name)
+                        self.shape_names.append(shape_name)
                 es_caps.check_atlas(morph["width"], morph["height"])
                 print("ES_MORPH shapes=%d verts=%d atlas=%dx%d "
                       "mscale=%.5f nscale=%.5f" % (
                           morph["nshapes"], morph["nverts"],
                           morph["width"], morph["height"],
                           morph["mscale"], morph["nscale"]))
-            for sub_tris, local in es_gltf.split_by_joints(tris, jj, ww, cap):
-                used = set()
-                for tri in sub_tris:
-                    used.update(tri)
-                order = sorted(used)
-                remap = {g: l for l, g in enumerate(order)}
-                sv = [None] * len(order)
-                sn = [None] * len(order)
-                sj = [None] * len(order)
-                sw = [None] * len(order)
-                svid = [None] * len(order)
-                for g, l in remap.items():
-                    # Y-flip (glTF Y-up -> screen Y-down) baked here; joint
-                    # matrices get the conjugate flip at palette time.
-                    sv[l] = (s + v[g][0], s - v[g][1], v[g][2])
-                    sn[l] = (n[g][0], -n[g][1], n[g][2])
+            for part_tris, part_joints in es_gltf.split_by_joints(
+                    tris, joint_rows, weight_rows, bone_cap):
+                referenced = set()
+                for tri in part_tris:
+                    referenced.update(tri)
+                kept = sorted(referenced)
+                global_to_local = dict((global_index, local_index)
+                                       for local_index, global_index
+                                       in enumerate(kept))
+                part_verts = [None] * len(kept)
+                part_normals = [None] * len(kept)
+                part_joint_ids = [None] * len(kept)
+                part_weights = [None] * len(kept)
+                part_atlas_ids = [None] * len(kept)
+                part_joint_set = set(part_joints)
+                for global_index, local_index in global_to_local.items():
+                    # Y-flip (glTF Y-up -> screen Y-down) baked here; the
+                    # skeleton's fit-space constants carry the same flip.
+                    part_verts[local_index] = (
+                        half_size + verts[global_index][0],
+                        half_size - verts[global_index][1],
+                        verts[global_index][2])
+                    part_normals[local_index] = (
+                        normals[global_index][0],
+                        -normals[global_index][1],
+                        normals[global_index][2])
                     # Pool-local vertex id: indexes the morph atlas rows
                     # exactly like the base vertex list above. 1-tuple:
                     # mesh3_from_layout iterates each group's frame value.
-                    svid[l] = (float(g),)
+                    part_atlas_ids[local_index] = (float(global_index),)
                     # Нулевые веса ссылаются на кости вне палитры —
                     # им все равно какой индекс (вклад нулевой).
-                    _loc = set(local)
-                    sj[l] = tuple(
-                        float(local.index(int(x)))
-                        if (float(w) > 0.0 and int(x) in _loc) else 0.0
-                        for x, w in zip(jj[g], ww[g]))
-                    sw[l] = ww[g]
-                st = [tuple(remap[x] for x in tri) for tri in sub_tris]
+                    part_joint_ids[local_index] = tuple(
+                        float(part_joints.index(int(joint)))
+                        if (float(weight) > 0.0
+                            and int(joint) in part_joint_set)
+                        else 0.0
+                        for joint, weight in zip(joint_rows[global_index],
+                                                 weight_rows[global_index]))
+                    part_weights[local_index] = weight_rows[global_index]
+                part_indices = [tuple(global_to_local[x] for x in tri)
+                                for tri in part_tris]
                 mesh = es_step3.mesh3_from_layout(
-                    sv, [sj, sw, sn, svid], st,
+                    part_verts,
+                    [part_joint_ids, part_weights, part_normals,
+                     part_atlas_ids], part_indices,
                     [("a_joints", 4), ("a_weights", 4), ("a_norm3", 3),
                      ("a_vid", 1)])
-                self.splits.append({"mesh": mesh, "palette": local,
+                self.splits.append({"mesh": mesh, "joints": part_joints,
                                     "model": None, "morph": morph})
-        # FIT-преобразование буфер<->rig: P_buf = FIT * X * FITINV,
-        # где X = update() (уже W * ibm слитно). Отдельного Q не нужно:
-        # worlds[] из update() уже содержит W*ibm, домножать ibm еще
-        # раз (как раньше через _joint_q) — двойное применение.
-        # (M mesh-узлов здесь I; иначе нужен еще M * ... * M^-1.)
-        _IQ = (0.0, 0.0, 0.0, 1.0)
-        _B = (s, s, 0.0)
-        _TB = es_gltf.mat4_trs(_B, _IQ, (1.0, 1.0, 1.0))
-        _TnB = es_gltf.mat4_trs(tuple(-x for x in _B), _IQ,
-                                (1.0, 1.0, 1.0))
-        _F = es_gltf.mat4_trs((0.0, 0.0, 0.0), _IQ, (1.0, -1.0, 1.0))
-        _S = es_gltf.mat4_trs((0.0, 0.0, 0.0), _IQ,
-                              (scale, scale, scale))
-        _SI = es_gltf.mat4_trs((0.0, 0.0, 0.0), _IQ,
-                               (1.0 / scale, 1.0 / scale, 1.0 / scale))
-        _Tmc = es_gltf.mat4_trs(tuple(-x for x in center), _IQ,
-                                (1.0, 1.0, 1.0))
-        _Tc = es_gltf.mat4_trs(tuple(center), _IQ, (1.0, 1.0, 1.0))
-        _fit = es_gltf.mat4_mul(es_gltf.mat4_mul(es_gltf.mat4_mul(_TB, _F),
-                                                _S), _Tmc)
-        _fitinv = es_gltf.mat4_mul(es_gltf.mat4_mul(es_gltf.mat4_mul(_Tc, _SI),
-                                                   _F), _TnB)
-        self._fit = _fit
-        self._fitinv = _fitinv
+        # The palette composes in this buffer space, not rig space: handing
+        # the fit to the skeleton once is what keeps FIT out of every frame.
+        self.skel.use_fit_space(self.fit, self.fit_inverse)
 
     def update(self, st, dt):
         self.angle = (st * self.speed) % 360.0
 
 
 class SkinnedView(Displayable):
-    """Drives one SkinnedObject: pose -> palettes -> N model draws."""
+    """Drives one SkinnedObject: pose -> palette -> N model draws."""
 
     def __init__(self, obj, **kwargs):
         super(SkinnedView, self).__init__(**kwargs)
         es_caps.ensure()
         self.obj = obj
+        self.splits = obj.splits
         self.models = []
+        self.bone_count = obj.material.max_bones
+        self.shape_slot_count = es_caps.slots()
         self._identity = None
-        self._splits = obj.splits
-        _dbg_seen = [False]
-        for sp in obj.splits:
-            m = renpy.display.model.Model(size=(obj.size, obj.size))
-            m.shader("renpy.geometry")
-            mm = sp["morph"]
+        logged_morph_shader = False
+        for split in obj.splits:
+            model = renpy.display.model.Model(size=(obj.size, obj.size))
+            model.shader("renpy.geometry")
+            morph = split["morph"]
             # Only atlas-carrying splits get the morph program: it alone
             # declares tex0/u_sw* (draw() raises on unset uniforms).
-            _shname = obj.material.shader_name(
-                morph=(es_caps.slots() if mm is not None else 0))
-            m.shader(_shname)
-            if mm is not None and not _dbg_seen[0]:
-                _dbg_seen[0] = True
+            shader_name = obj.material.shader_name(
+                morph=(self.shape_slot_count if morph is not None else 0))
+            model.shader(shader_name)
+            if morph is not None and not logged_morph_shader:
+                logged_morph_shader = True
                 print("ES_DBG_VIEW size=%.0f shader=%s mscale=%.4f "
                       "nverts=%d shapes=%d seen=%d" % (
-                          obj.size, _shname, mm["mscale"], mm["nverts"],
-                          len(obj.shape_names), len(obj._shape_seen)))
+                          obj.size, shader_name, morph["mscale"],
+                          morph["nverts"], len(obj.shape_names),
+                          len(obj._shape_seen)))
             # Без личного depth: общий клеар — на родителе (см. render),
             # иначе каждый сплит чистит буфер и рушит окклюзию соседей.
-            m.uniform("u_view_dir", Object3D.view_dir)
-            m.uniform("u_base_color", obj.material.base_color)
-            if mm is not None:
+            model.uniform("u_view_dir", Object3D.view_dir)
+            model.uniform("u_base_color", obj.material.base_color)
+            if morph is not None:
                 # Atlas must be texture 0: its sampler is named tex0.
-                m.texture(mm["displayable"])
-                m.uniform("u_mscale", mm["mscale"])
-                m.uniform("u_nscale", mm["nscale"])
-                m.uniform("u_nv", float(mm["nverts"]))
-                m.uniform("u_as",
-                          (float(mm["width"]), float(mm["height"])))
-            m._mesh = sp["mesh"]
-            sp["model"] = m
-            self.models.append(m)
+                model.texture(morph["displayable"])
+                model.uniform("u_mscale", morph["mscale"])
+                model.uniform("u_nscale", morph["nscale"])
+                model.uniform("u_nv", float(morph["nverts"]))
+                model.uniform("u_as", (float(morph["width"]),
+                                       float(morph["height"])))
+            model._mesh = split["mesh"]
+            split["model"] = model
+            self.models.append(model)
 
     @staticmethod
-    def _flat16(mat):
-        return [float(mat[i][j]) for i in range(4) for j in range(4)]
+    def _flatten(matrix):
+        """Row-major 4x4 -> the 16-float list a renpy Matrix is built from."""
+        return [float(matrix[i][j]) for i in range(4) for j in range(4)]
 
     def render(self, w, h, st, at):
         obj = self.obj
@@ -597,58 +697,56 @@ class SkinnedView(Displayable):
         obj.update(st, dt)
         light = (obj.material.light_dir
                  if obj.material.light_dir is not None else LIGHT_DIR)
-        worlds = obj.skel.update()
-        nbones = obj.material.max_bones
+        # skel.update() already answers in buffer space, so a joint matrix
+        # needs no per-slot work here. Splits share joints, so the list +
+        # Matrix construction runs once per joint, not once per slot.
+        palette = dict((joint, _Matrix(self._flatten(bone_matrix)))
+                       for joint, bone_matrix in obj.skel.update().items())
         if self._identity is None:
             self._identity = _Matrix([1.0, 0.0, 0.0, 0.0,
                                       0.0, 1.0, 0.0, 0.0,
                                       0.0, 0.0, 1.0, 0.0,
                                       0.0, 0.0, 0.0, 1.0])
-        for sp, m in zip(self._splits, self.models):
-            for li, ji in enumerate(sp["palette"]):
-                # Палитра в пространстве буфера: FIT * X * FITINV, где X —
-                # update() (уже W * ibm слитно). Отдельного Q не нужно.
-                _P = es_gltf.mat4_mul(
-                    es_gltf.mat4_mul(obj._fit, worlds[ji]),
-                    obj._fitinv)
-                flat = SkinnedView._flat16(_P)
-                m.uniform("u_bone%d" % li, _Matrix(flat))
+        for split, model in zip(self.splits, self.models):
+            split_joints = split["joints"]
+            for local_index, joint in enumerate(split_joints):
+                model.uniform("u_bone%d" % local_index, palette[joint])
             # draw() требует ВСЕ объявленные uniform'ы: добиваем identity.
-            for li in range(len(sp["palette"]), nbones):
-                m.uniform("u_bone%d" % li, self._identity)
-            m.uniform("u_spin", obj.angle)
-            m.uniform("u_light_dir", light)
-            mm = sp["morph"]
-            if mm is not None:
+            for local_index in range(len(split_joints), self.bone_count):
+                model.uniform("u_bone%d" % local_index, self._identity)
+            model.uniform("u_spin", obj.angle)
+            model.uniform("u_light_dir", light)
+            morph = split["morph"]
+            if morph is not None:
                 # Active (row, weight) pairs for this pool's atlas,
                 # padded to the declared slot count like u_bone* above.
-                row = mm["row"]
-                slots = []
-                for nm, wt in obj.shapes.items():
-                    r = row.get(nm)
-                    if r is not None and wt:
-                        slots.append((r, float(wt)))
-                slots.sort()
-                slots = slots[:es_caps.slots()]
-                if not getattr(self, "_dbg_slots", False) and slots:
-                    self._dbg_slots = True
+                atlas_rows = morph["row"]
+                active_shapes = []
+                for shape_name, weight in obj.shapes.items():
+                    row = atlas_rows.get(shape_name)
+                    if row is not None and weight:
+                        active_shapes.append((row, float(weight)))
+                active_shapes.sort()
+                active_shapes = active_shapes[:self.shape_slot_count]
+                if not getattr(self, "_logged_slots", False) and active_shapes:
+                    self._logged_slots = True
                     print("ES_DBG_SLOTS %.1f size=%.0f %r" % (
-                        st, obj.size, slots))
-                for k in range(es_caps.slots()):
-                    if k < len(slots):
-                        m.uniform("u_sw%d" % k, slots[k])
+                        st, obj.size, active_shapes))
+                for slot in range(self.shape_slot_count):
+                    if slot < len(active_shapes):
+                        model.uniform("u_sw%d" % slot, active_shapes[slot])
                     else:
-                        m.uniform("u_sw%d" % k, (0.0, 0.0))
+                        model.uniform("u_sw%d" % slot, (0.0, 0.0))
         rv = renpy.display.render.Render(int(obj.size), int(obj.size))
         # Один depth-клеар на всех соседей: draw() чистит буфер в узле
         # с property depth и ставит has_depth наследникам — сплиты делят
-        # один тест вместо 30 чисток (иначе порядок неверный).
+        # один тест вместо чистки на каждый (иначе порядок неверный).
         rv.add_property("depth", True)
-        for sp, m in zip(self._splits, self.models):
-            cr = renpy.display.render.render(
-                _TransformWrap(m, obj), obj.size, obj.size, st, at)
-            rv.blit(cr, (0, 0))
-            renpy.display.render.redraw(m, 0.016)
+        for split, model in zip(self.splits, self.models):
+            drawn = renpy.display.render.render(
+                _TransformWrap(model, obj), obj.size, obj.size, st, at)
+            rv.blit(drawn, (0, 0))
+            renpy.display.render.redraw(model, 0.016)
         if obj.animated:
             renpy.display.render.redraw(self, 0.016)
         return rv
@@ -663,9 +761,8 @@ class _TransformWrap(Displayable):
         self.obj = obj
 
     def render(self, w, h, st, at):
-        inner = Transform(
+        turntable = Transform(
             self.model,
-            matrixtransform=_Matrix.rotate(self.obj.tilt, self.obj.angle,
-                                           0.0),
+            matrixtransform=_Matrix.rotate(self.obj.tilt, self.obj.angle, 0.0),
             perspective=True)
-        return renpy.display.render.render(inner, w, h, st, at)
+        return renpy.display.render.render(turntable, w, h, st, at)
