@@ -19,7 +19,6 @@ init python:
     if _md not in _sys.path:
         _sys.path.insert(0, _md)
 
-    import es_cpu as _cpu
     import es_engine as _eng
 
     # Shift+R purges these from sys.modules, so their module-level state --
@@ -27,11 +26,13 @@ init python:
     # .mat/.glsl files instead of serving stale programs inside one process.
     config.reload_modules += ["es_matlib", "es_engine", "es_shaders",
                               "es_gltf", "es_obj", "es_morph", "es_step3",
-                              "es_caps", "es_cpu"]
+                              "es_caps"]
 
 
 init python:
     def use_model_renderer():
-        """True when Ren'Py's Model/Mesh3 path is live; else CPU fallback."""
+        """True when Ren'Py's Model/Mesh3 path is live. There is no second
+        renderer: if this is False, the engine cannot draw and a content mod
+        should say so rather than try."""
         import renpy.display.render as R
         return bool(getattr(R, "models", False))

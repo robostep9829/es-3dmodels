@@ -55,8 +55,8 @@ def define_material(name, fragment, params=None, requires=(), map_path=None,
     premultiply and the write to gl_FragColor. It may read whatever the
     vertex stage provides: v_normal, v_diff, v_half, v_pos (the rotated
     position, which with u_eye_z gives a per-fragment view direction),
-    u_base_color, u_light_dir, u_view_dir, u_spin -- plus v_uv when the mesh
-    carries UVs.
+    u_base_color, u_light_dir, u_view_dir -- plus v_uv when the mesh carries
+    UVs.
     Everything tunable goes through `params` (a float, or a 2-4 element
     sequence); declarations are generated from those values.
 
@@ -189,15 +189,41 @@ class Material(object):
             return es_shaders.ensure_fallback()
 
 
+def _object_matrix(obj):
+    """The object's model matrix: rotate about its own centre, then move.
+
+    This one Matrix is what both the Transform and the shader get, so the
+    geometry and the normals cannot disagree."""
+    return _Matrix.offset(obj.pos[0], obj.pos[1], obj.pos[2]) * _Matrix.rotate(
+        obj.tilt, obj.angle, obj.roll)
+
+
+def _matrix_uniforms(m):
+    """(u_n0, u_n1, u_n2, u_off) from a Matrix.
+
+    Ren'Py stores 16 floats column-wise under x/y/z/w names and transforms a
+    point as x' = xdx*x + xdy*y + xdz*z + xdw*w, so the rows the shader needs
+    are m[0,4,8], m[1,5,9], m[2,6,10] and the move is m[12,13,14]."""
+    return ((m[0], m[4], m[8]), (m[1], m[5], m[9]), (m[2], m[6], m[10]),
+            (m[12], m[13], m[14]))
+
+
 class Object3D(object):
     """Geometry + material + animation state. Subclass, override update()."""
 
     view_dir = (0.0, 0.0, 1.0)
 
-    def __init__(self, size=400.0, speed=120.0, tilt=25.0, material=None):
+    def __init__(self, size=400.0, speed=120.0, tilt=25.0, roll=0.0,
+                 pos=(0.0, 0.0, 0.0), material=None):
         self.size = size
         self.speed = speed
         self.tilt = tilt
+        self.roll = roll
+        # Units are the same buffer space the fit maps the model into, applied
+        # before the perspective, so how far this moves the object on screen
+        # depends on its depth -- as it should for a 3D move, and why a
+        # translation here is not a screen-pixel offset.
+        self.pos = tuple(pos)
         self.angle = 0.0
         self.animated = True
         self.material = material if material is not None else Material()
@@ -251,10 +277,10 @@ class CubeObject(Object3D):
              ([0, 1, 5, 4], (0, -1, 0)), ([2, 3, 7, 6], (0, 1, 0)),
              ([0, 3, 7, 4], (-1, 0, 0)), ([1, 2, 6, 5], (1, 0, 0))]
 
-    def __init__(self, size=400.0, speed=120.0, tilt=25.0,
-                 color=(0.9, 0.3, 0.3)):
+    def __init__(self, size=400.0, speed=120.0, tilt=25.0, roll=0.0,
+                 pos=(0.0, 0.0, 0.0), color=(0.9, 0.3, 0.3)):
         super(CubeObject, self).__init__(
-            size, speed, tilt,
+            size, speed, tilt, roll, pos,
             Material(base_color=(color[0], color[1], color[2], 1.0)))
         h = CubeObject.HALF
         for quad, normal in CubeObject.FACES:
@@ -271,9 +297,9 @@ class MeshObject(Object3D):
 
     @classmethod
     def from_data(cls, verts, normals, tris, uvs=None, size=500.0,
-                  speed=45.0, tilt=25.0, color=(0.85, 0.85, 0.9),
-                  recipe=None):
-        obj = cls(size=size, speed=speed, tilt=tilt,
+                  speed=45.0, tilt=25.0, roll=0.0, pos=(0.0, 0.0, 0.0),
+                  color=(0.85, 0.85, 0.9), recipe=None):
+        obj = cls(size=size, speed=speed, tilt=tilt, roll=roll, pos=pos,
                   material=Material(
                       base_color=(color[0], color[1], color[2], 1.0),
                       recipe=recipe))
@@ -285,9 +311,10 @@ class MeshObject(Object3D):
         return obj
 
     @classmethod
-    def from_obj(cls, path, size=500.0, speed=60.0, tilt=25.0,
-                 color=(0.85, 0.85, 0.9), target=300.0, recipe=None):
-        obj = cls(size=size, speed=speed, tilt=tilt,
+    def from_obj(cls, path, size=500.0, speed=60.0, tilt=25.0, roll=0.0,
+                 pos=(0.0, 0.0, 0.0), color=(0.85, 0.85, 0.9), target=300.0,
+                 recipe=None):
+        obj = cls(size=size, speed=speed, tilt=tilt, roll=roll, pos=pos,
                   material=Material(
                       base_color=(color[0], color[1], color[2], 1.0),
                       recipe=recipe))
@@ -347,11 +374,10 @@ class ObjectView(Displayable):
         obj._last_st = st
         obj.update(st, dt)
         self._sync_material()
-        self.model.uniform("u_spin", obj.angle)
-        # The vertex stage rotates normals analytically, so it needs the same
-        # tilt the model matrix was built with -- a hardcoded one put the
-        # shading 25 degrees off any object that did not tilt by 25.
-        self.model.uniform("u_tilt", obj.tilt)
+        matrix = _object_matrix(obj)
+        for name, value in zip(("u_n0", "u_n1", "u_n2", "u_off"),
+                               _matrix_uniforms(matrix)):
+            self.model.uniform(name, value)
         # Eye distance in buffer pixels, from the same perspective the
         # transform is built with: v_pos + u_eye_z is what lets a fragment
         # derive a per-pixel view vector, the only thing that gives a flat
@@ -367,7 +393,7 @@ class ObjectView(Displayable):
             self.model.uniform("u_alpha_clip", obj.material.alpha_clip)
         turntable = Transform(
             self.model,
-            matrixtransform=_Matrix.rotate(obj.tilt, obj.angle, 0.0),
+            matrixtransform=matrix,
             perspective=True)
         if obj.animated:
             # redraw() должен получать И model: кеш render() ключуется
@@ -602,16 +628,17 @@ def _view_depth(centroid, size, tilt, angle):
 class SkinnedObject(Object3D):
     """glTF mesh skinned on GPU. update() poses joints, view pushes palette."""
 
-    def __init__(self, gltf, size=600.0, speed=30.0, tilt=25.0,
-                 color=(0.85, 0.8, 0.75), max_bones=None, target=300.0,
-                 recipe=None):
+    def __init__(self, gltf, size=600.0, speed=30.0, tilt=25.0, roll=0.0,
+                 pos=(0.0, 0.0, 0.0), color=(0.85, 0.8, 0.75), max_bones=None,
+                 target=300.0, recipe=None):
         import es_gltf
         if isinstance(gltf, basestring):
             gltf = es_gltf.Gltf.load(gltf)
         material = Material(
             base_color=(color[0], color[1], color[2], 1.0),
             skinned=True, max_bones=max_bones, recipe=recipe)
-        super(SkinnedObject, self).__init__(size, speed, tilt, material)
+        super(SkinnedObject, self).__init__(size, speed, tilt, roll, pos,
+                                            material)
         self.skel = Skeleton(gltf)
         self.splits = []
         # A recipe that names a glTF material takes over that group's splits
@@ -936,6 +963,9 @@ class SkinnedView(Displayable):
                                       0.0, 1.0, 0.0, 0.0,
                                       0.0, 0.0, 1.0, 0.0,
                                       0.0, 0.0, 0.0, 1.0])
+        matrix = _object_matrix(obj)
+        model_uniforms = list(zip(("u_n0", "u_n1", "u_n2", "u_off"),
+                                  _matrix_uniforms(matrix)))
         for split, model in zip(self.splits, self.models):
             split_joints = split["joints"]
             for local_index, joint in enumerate(split_joints):
@@ -943,8 +973,8 @@ class SkinnedView(Displayable):
             # draw() требует ВСЕ объявленные uniform'ы: добиваем identity.
             for local_index in range(len(split_joints), self.bone_count):
                 model.uniform("u_bone%d" % local_index, self._identity)
-            model.uniform("u_spin", obj.angle)
-            model.uniform("u_tilt", obj.tilt)
+            for name, value in model_uniforms:
+                model.uniform(name, value)
             model.uniform("u_eye_z", renpy.config.perspective[1])
             model.uniform("u_light_dir", light)
             for name, value in split["material"].params.items():
@@ -1012,6 +1042,6 @@ class _TransformWrap(Displayable):
     def render(self, w, h, st, at):
         turntable = Transform(
             self.model,
-            matrixtransform=_Matrix.rotate(self.obj.tilt, self.obj.angle, 0.0),
+            matrixtransform=_object_matrix(self.obj),
             perspective=True)
         return renpy.display.render.render(turntable, w, h, st, at)

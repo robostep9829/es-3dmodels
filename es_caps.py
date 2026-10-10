@@ -30,10 +30,10 @@ MARGIN = 0.9             # slack on the vertex-uniform budget
 
 # Uniform components per skinned draw (GLSL counts: mat4 = 16):
 # u_transform 16 + u_base_color 4 + u_light_dir 3 + u_view_dir 3 +
-# u_spin 1 = 27; the morph variant adds u_mscale/u_nscale/u_nv 3 +
-# u_as 2 + tex0 sampler 4 (counted fat) -> 40.
-FIXED_PLAIN = 27
-FIXED_MORPH = 40
+# u_n0/u_n1/u_n2/u_off 12 = 38; the morph variant adds
+# u_mscale/u_nscale/u_nv 3 + u_as 2 + tex0 sampler 4 (counted fat) -> 51.
+FIXED_PLAIN = 38
+FIXED_MORPH = 51
 
 _state = {"done": False, "decision": None, "caps": None, "fail": False}
 

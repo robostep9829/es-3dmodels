@@ -22,8 +22,8 @@ _fallback_done = [False]
 # already declare. A parameter reusing one of these names would emit a second
 # declaration of it and the program would fail to compile.
 _RESERVED = ("u_transform", "u_base_color", "u_light_dir", "u_view_dir",
-             "u_spin", "u_tilt", "u_eye_z", "u_mscale", "u_nscale", "u_nv",
-             "u_as",
+             "u_n0", "u_n1", "u_n2", "u_off", "u_eye_z",
+             "u_mscale", "u_nscale", "u_nv", "u_as",
              "v_normal", "v_half", "v_diff", "v_pos", "a_position",
              "a_normal",
              "a_norm3", "a_joints", "a_weights", "a_vid", "a_uv",
@@ -268,8 +268,10 @@ _VARIABLES = """
 uniform vec3 u_light_dir;
 uniform vec3 u_view_dir;
 uniform vec4 u_base_color;
-uniform float u_spin;
-uniform float u_tilt;
+uniform vec3 u_n0;
+uniform vec3 u_n1;
+uniform vec3 u_n2;
+uniform vec3 u_off;
 uniform float u_eye_z;
 varying vec3 v_normal;
 varying vec3 v_half;
@@ -310,18 +312,16 @@ vec3 skP = a_position.xyz;
 vec3 skN = a_norm3;
 """
 
-# Analytic normal rotation. Row order copies rotate_matrix(x, y, 0)
-# from matrix_functions.pxi, so it matches Matrix.rotate(tilt, angle, 0).
+# Normals and positions rotate through u_n0..u_n2 / u_off: the three rows of
+# the 3x3 and the translation column of the *same* Matrix the view passes to
+# matrixtransform. Hand-writing the rotation rows instead mirrored that matrix
+# in GLSL, and the mirror silently drifted whenever the Python side changed --
+# it hardcoded a 25-degree tilt, so every object with another tilt shaded 25
+# degrees off its own geometry. One matrix on both sides cannot disagree.
 _VERTEX = """
-vec3 wnormal = normalize(vec3(
-    es_ca * skN.x + es_sx * es_sa * skN.y + es_cx * es_sa * skN.z,
-    es_cx * skN.y - es_sx * skN.z,
-    -es_sa * skN.x + es_sx * es_ca * skN.y + es_cx * es_ca * skN.z));
+vec3 wnormal = normalize(vec3(dot(u_n0, skN), dot(u_n1, skN), dot(u_n2, skN)));
 v_normal = wnormal;
-v_pos = vec3(
-    es_ca * skP.x + es_sx * es_sa * skP.y + es_cx * es_sa * skP.z,
-    es_cx * skP.y - es_sx * skP.z,
-    -es_sa * skP.x + es_sx * es_ca * skP.y + es_cx * es_ca * skP.z);
+v_pos = vec3(dot(u_n0, skP), dot(u_n1, skP), dot(u_n2, skP)) + u_off;
 vec3 L = normalize(u_light_dir);
 vec3 V = normalize(u_view_dir);
 v_half = normalize(L + V);
@@ -329,13 +329,6 @@ v_diff = max(dot(wnormal, L), 0.0);
 vec4 es_p = u_transform * vec4(skP.xyz, 1.0);
 es_p.z = clamp(es_p.z, 0.0, 0.99 * es_p.w);
 gl_Position = es_p;
-"""
-
-_VERTEX_SPIN = """
-float es_sa = sin(radians(u_spin));
-float es_ca = cos(radians(u_spin));
-float es_sx = sin(radians(u_tilt));
-float es_cx = cos(radians(u_tilt));
 """
 
 # --- Shape-key (morph target) variant -----------------------------------
@@ -550,8 +543,7 @@ def get_variant(specular=True, normal_viz=False, shininess=16.0,
         skin = _VERTEX_RIGID
     if uvs:
         variables = variables + _UV_DECL
-    vertex = (prelude + skin + (_UV_PASS if uvs else "") + "\n"
-              + _VERTEX_SPIN + _VERTEX)
+    vertex = (prelude + skin + (_UV_PASS if uvs else "") + "\n" + _VERTEX)
     label = recipe or "es_mat3"
     _validate(label + ".vertex", vertex)
     _validate(label + ".fragment", fragment)
