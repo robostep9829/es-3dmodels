@@ -9,7 +9,7 @@ Proven rules this encodes (see project history):
 - rotation lives in the model matrix (auto-centered pivot), never in verts,
 - Mesh3 fields are cdef-only: uploads go through es_step3's poked offsets,
 - depth test needs the direct-draw path: show WITHOUT dissolve,
-- normals rotate analytically in-shader (u_transform collapses them),
+- normals rotate by a matrix uniform (u_transform collapses them),
 - the bone palette composes in buffer (FIT) space: conjugation distributes
   over the joint chain, so FIT rides on bind constants, never per frame.
 """

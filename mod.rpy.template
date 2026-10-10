@@ -1,0 +1,74 @@
+# -*- coding: utf-8 -*-
+# TEMPLATE -- Ren'Py does not load files that do not end in `.rpy`. To use it:
+#
+#   1. copy this file to game/mods/<your-mod-name>/<your-mod-name>.rpy
+#   2. replace every YOURMOD below with that same name
+#   3. put your models in game/mods/<your-mod-name>/ and materials in
+#      game/mods/<your-mod-name>/materials/ (see MATERIALS.md)
+#
+# This is the smallest mod that boots the engine, appears in the game's mod
+# menu and draws something.
+init 10 python:
+    YOURMOD_DIR = "mods/YOURMOD"
+
+    # The engine is a library mod: it registers no label and no menu entry, it
+    # just puts itself on sys.path from its own `init` at priority 0. So by
+    # priority 10 a failed import really does mean it is not installed, and
+    # everything below can only be defined inside the success branch because it
+    # derives from engine types.
+    YOURMOD_OK = False
+    YOURMOD_ERR = ""
+    try:
+        import es_engine as _eng
+        YOURMOD_OK = True
+    except ImportError as _e:
+        YOURMOD_ERR = repr(_e)
+
+    if YOURMOD_OK:
+        # Loads every .mat in that folder. Safe to call with a folder that does
+        # not exist yet -- it returns []. Recipes that declare `applies` attach
+        # themselves here, with no call site.
+        _eng.add_materials(YOURMOD_DIR + "/materials")
+
+
+init 10:
+    $ mods["YOURMOD"] = u"My 3D models (needs es-3dmodels)"
+
+
+# The label name must match the key above; that is how the mod menu runs it.
+label YOURMOD:
+    if not YOURMOD_OK:
+        "Engine es-3dmodels not found: [YOURMOD_ERR]"
+        "Install it into game/mods/ and restart."
+        return
+
+    $ renpy.scene()
+    show expression Solid("#e08c14", xsize=1280, ysize=720) as bg at truecenter
+    pause 0.3
+
+    # Geometry from an OBJ: verts, normals and tris are fitted to `target`,
+    # then the whole thing is scaled to `size` screen pixels. The loaders open
+    # paths with plain open(), so resolve the game-relative name first --
+    # transfn finds the file on disk or inside an .rpa.
+    $ _objpath = renpy.loader.transfn(YOURMOD_DIR + "/game-ready.obj")
+    $ _obj = _eng.MeshObject.from_obj(
+        _objpath, size=500.0, speed=45.0, tilt=20.0)
+
+    # Show it WITHOUT a transition. The depth test needs the direct-draw path,
+    # and `with dissolve` routes the view through an off-screen buffer.
+    show expression _eng.ObjectView(_obj) as model at center
+
+    "Spinning: tilt is rotation about X, speed is degrees per second about Y."
+    $ _obj.speed = 0.0
+    "Stopped. `angle`, `tilt` and `roll` are live, as is `pos`."
+    $ _obj.roll = 30.0
+    $ _obj.pos = (120.0, -60.0, 0.0)
+    pause 1.5
+
+    # Built-in lighting flags on the default material, no .glsl needed.
+    $ _obj.material.spec_weight = 1.2
+    $ _obj.material.shininess = 48.0
+    pause 1.5
+
+    hide model
+    return

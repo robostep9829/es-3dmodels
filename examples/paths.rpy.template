@@ -1,0 +1,159 @@
+# -*- coding: utf-8 -*-
+# TEMPLATE -- copy into game/mods/<name>/<name>.rpy, rename the label, and each
+# function below is one independent path through the engine, so delete the ones
+# you do not need. See MATERIALS.md for the material format and the rules these
+# examples lean on.
+#
+# Everything lives in one `init 10 python:` block: the class derives from an
+# engine type, so it can only be defined where the import has already worked,
+# and Ren'Py has no file-scope `python:` outside a block.
+init 10 python:
+    try:
+        import es_engine as _eng
+        ES_PATHS_OK = True
+    except ImportError:
+        ES_PATHS_OK = False
+
+    # Point these at your own assets. Note the transfn(): the loaders open
+    # paths with plain open(), unlike add_materials which takes a game-relative
+    # folder, so a loose "mods/..." string will not resolve -- transfn finds the
+    # file whether it is on disk or packed in an .rpa.
+    ES_PATHS_GLB = renpy.loader.transfn(
+        "mods/es-3dmodels-matitan/matitan-retopo-names.glb")
+    ES_PATHS_OBJ = renpy.loader.transfn(
+        "mods/es-3dmodels-matitan/game-ready.obj")
+
+    if ES_PATHS_OK:
+
+        # --- 1. procedural geometry, no asset file --------------------
+        # Object3D stores verts/normals/tris; add_quad appends a flat lit
+        # quad. Use it for debug planes and cards you would rather not ship
+        # as a file.
+        def make_plate():
+            o = _eng.Object3D(size=400.0, speed=0.0, tilt=0.0)
+            o.add_quad([(-150.0, -100.0, 0.0), (150.0, -100.0, 0.0),
+                        (150.0, 100.0, 0.0), (-150.0, 100.0, 0.0)],
+                       (0.0, 0.0, -1.0))
+            o.build_mesh()
+            return o
+
+        # --- 2. rigid mesh from an OBJ --------------------------------
+        # Fitted to `target` units, drawn `size` screen pixels.
+        def from_obj():
+            return _eng.MeshObject.from_obj(
+                ES_PATHS_OBJ, size=500.0, speed=45.0, tilt=20.0, roll=0.0,
+                pos=(0.0, 0.0, 0.0), color=(0.85, 0.85, 0.9))
+
+        # --- 3. glTF, bind pose, still rigid --------------------------
+        # es_gltf_bind flattens the rig into (verts, normals, tris, uvs), so a
+        # posed asset draws without the skinning path at all -- the quickest
+        # way to tell a geometry artifact from a skinning one.
+        def from_bind_pose():
+            verts, normals, tris, uvs = _eng.es_gltf_bind(ES_PATHS_GLB,
+                                                          target=300.0)
+            return _eng.MeshObject.from_data(
+                verts, normals, tris, uvs, size=600.0, speed=30.0, tilt=0.0)
+
+        # --- 4. skinned glTF, joints and shape keys -------------------
+        class TurnedModel(_eng.SkinnedObject):
+            """Subclass and override update() to animate. It runs once per
+            frame before the uniforms are pushed, so what it writes shows the
+            same frame. `st` is seconds since the view started."""
+
+            def update(self, st, dt):
+                self.angle = (st * 30.0) % 360.0
+                # Weights are per shape-key name and unknown names are dropped
+                # silently, so read shape_names rather than guessing.
+                if self.shape_names:
+                    self.set_shape(self.shape_names[0],
+                                   0.5 + 0.5 * (st % 2.0))
+
+        def skinned():
+            o = TurnedModel(ES_PATHS_GLB, size=900.0, tilt=0.0, target=850.0)
+            # Pose a joint by name or index. The override persists until
+            # written again, so it survives the turntable above.
+            try:
+                o.skel.pose_euler("Head", rx=15.0)
+            except Exception:
+                pass
+            return o
+
+        # --- 5. a material authored from Python, no .mat --------------
+        # Same backend the .mat files drive and the same validation. Every
+        # tunable goes through `params`: a declaration written into the
+        # fragment is rejected, and Ren'Py's ShaderPart would drop it anyway.
+        def define_from_python():
+            _eng.define_material(
+                "paths_flat",
+                "es_color = vec4(u_tint, u_opacity);",
+                params={"u_tint": (0.9, 0.45, 0.2), "u_opacity": 0.55},
+                blend="alpha", cull="back")
+            o = TurnedModel(ES_PATHS_GLB, size=900.0, tilt=0.0,
+                            target=850.0, recipe="paths_flat")
+            # recipe= is a default for the whole object, not a command: any
+            # group another mod routed with `applies` keeps that recipe
+            # instead. Print this to see what actually landed.
+            print("PATHS recipes=%r" % (
+                [s["material"].recipe for s in o.splits],))
+            return o
+
+        # --- 6. per-group materials, tuned live -----------------------
+        # A glTF carries several materials and the engine splits the mesh along
+        # them, so `splits` is where a single surface is addressed. set()
+        # pushes a uniform: cheap, effective next frame, no rebuild. It raises
+        # on a name the recipe does not declare, which is why this checks.
+        def tune_live(o):
+            for i, split in enumerate(o.splits):
+                if "u_opacity" in split["material"].params:
+                    split["material"].set("u_opacity", 0.25 + 0.05 * i)
+            return o
+
+        # --- 7. debug material flags ----------------------------------
+        # These select a compiled variant, so set them before building the
+        # view: a view already on screen keeps the program it was built with.
+        def show_normals():
+            o = TurnedModel(ES_PATHS_GLB, size=900.0, tilt=0.0, target=850.0)
+            o.material.normal_viz = True
+            return o
+
+
+label es_paths:
+    if not ES_PATHS_OK:
+        "Install es-3dmodels into game/mods/ and restart."
+        return
+
+    $ renpy.scene()
+    show expression Solid("#e08c14", xsize=1280, ysize=720) as bg at truecenter
+    pause 0.3
+
+    # Always show WITHOUT a transition. The depth test needs the direct-draw
+    # path, and `with dissolve` routes the view through an off-screen buffer.
+    show expression _eng.ObjectView(make_plate()) as plate at center
+    "1. procedural quad"
+    hide plate
+
+    show expression _eng.ObjectView(from_obj()) as rigid at center
+    "2. rigid OBJ"
+    hide rigid
+
+    show expression _eng.ObjectView(from_bind_pose()) as bind at center
+    "3. glTF flattened to its bind pose"
+    hide bind
+
+    show expression _eng.SkinnedView(skinned()) as skin at center
+    "4. skinned, joint posed, shape key ramping"
+    hide skin
+
+    $ _flat = define_from_python()
+    show expression _eng.SkinnedView(_flat) as flat at center
+    "5. material authored in Python, blended and back-face culled"
+    hide flat
+
+    show expression _eng.SkinnedView(tune_live(_flat)) as tuned at center
+    "6. per-group opacity, pushed live"
+    hide tuned
+
+    show expression _eng.SkinnedView(show_normals()) as nv at center
+    "7. normal visualisation"
+    hide nv
+    return
