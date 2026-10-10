@@ -59,28 +59,37 @@ def _png_rgba(width, height, rgba):
             chunk("IEND", ""))
 
 
-def make_displayable(width, height, rgba):
-    """Wrap atlas bytes as a size-stable texture source.
+_TextureSource = [None]
 
-    render() ignores the requested size and always returns ONE cached
-    Render at native atlas size: Model.texture() then sees identical
-    texels whatever size the Model asks for, and Ren'Py's
-    Render->texture cache (what.cached_texture, gl2draw.pyx) uploads
-    the atlas to the GPU exactly once. The PNG is decoded on first
-    render, then dropped. Ren'Py imports stay in here so the packer
-    above remains usable outside a running game.
-    """
+
+def _texture_source_class():
+    """The texture-backed Displayable, built on first use.
+
+    Deferred so this module stays importable without a running game: the
+    packer above is pure and unit-testable, only the class needs Ren'Py."""
+    if _TextureSource[0] is not None:
+        return _TextureSource[0]
+
     import renpy.display.core
     import renpy.display.render
 
-    class AtlasDisplayable(renpy.display.core.Displayable):
+    class TextureSource(renpy.display.core.Displayable):
+        """One surface, uploaded to the GPU once, at native resolution.
 
-        def __init__(self, width, height, png, **kwargs):
-            super(AtlasDisplayable, self).__init__(**kwargs)
+        render() ignores the size it is asked for and always returns the
+        same cached Render: Model.texture() then sees identical texels
+        whatever size the Model wants, and Ren'Py's Render->texture cache
+        (what.cached_texture, gl2draw.pyx) uploads exactly once. The surface
+        is decoded lazily and its size discovered from it, so a file on disk
+        needs no size handed in. `loader` is dropped after decoding."""
+
+        def __init__(self, loader, label, **kwargs):
+            super(TextureSource, self).__init__(**kwargs)
             self._duplicatable = False
-            self.atlas_width = width
-            self.atlas_height = height
-            self.png = png
+            self._loader = loader
+            self.label = label
+            self.tex_size = None
+            self._surf = None
             self._cached = None
             # False = upload not attempted yet, None = fallback,
             # otherwise the pre-uploaded full-res GLTexture.
@@ -91,10 +100,9 @@ def make_displayable(width, height, rgba):
             self._draw_size = None
 
         def _decode(self):
-            import io
-            import pygame
-            self._surf = pygame.image.load(io.BytesIO(self.png),
-                                           "atlas.png")
+            self._surf = self._loader()
+            self._loader = None
+            self.tex_size = self._surf.get_size()
 
         def _upload(self):
             # Hand Ren'Py a pre-uploaded texture instead of a pixel
@@ -104,9 +112,10 @@ def make_displayable(width, height, rgba):
             # 1920x1080) the packed atlas gets downsampled, neighbouring
             # texels bleed into each other and the decoded deltas turn
             # to garbage -- the face implodes. cached_texture
-            # short-circuits that RTT (gl2draw.pyx render_to_texture)
-            # and keeps the atlas at native resolution for any drawable
-            # size.
+            # short-circuits that RTT (gl2draw.pyx render_to_texture) and
+            # keeps the texture at native resolution for any drawable
+            # size. Maps want the same treatment: not for correctness,
+            # but so a 1024 texture is not resampled to the Model's size.
             if self._surf is None:
                 self._decode()
             gt = None
@@ -117,9 +126,11 @@ def make_displayable(width, height, rgba):
                     gt = draw.load_texture(self._surf, False, {})
                 except Exception as e:
                     err = e
-            print("ES_ATLAS draw=%r gt=%r err=%r" % (
+            print("ES_ATLAS %s draw=%r gt=%r err=%r size=%r" % (
+                self.label,
                 type(draw).__name__ if draw is not None else None,
-                type(gt).__name__ if gt is not None else None, err))
+                type(gt).__name__ if gt is not None else None, err,
+                self.tex_size))
             self._gt = gt
             if gt is None:
                 self._cached.blit(self._surf, (0, 0))
@@ -128,8 +139,7 @@ def make_displayable(width, height, rgba):
         def render(self, w, h, st, at):
             if self._cached is None:
                 self._decode()
-                self._cached = renpy.display.render.Render(
-                    self.atlas_width, self.atlas_height)
+                self._cached = renpy.display.render.Render(*self.tex_size)
 
             # A window resize deletes all GL texture names but keeps
             # loaded flags on orphaned GLTexture objects (Ren'Py only
@@ -141,8 +151,8 @@ def make_displayable(width, height, rgba):
             if (dsize is not None and self._gt is not None
                     and self._draw_size is not None
                     and dsize != self._draw_size):
-                print("ES_ATLAS resize %r -> %r, reupload" % (
-                    self._draw_size, dsize))
+                print("ES_ATLAS %s resize %r -> %r, reupload" % (
+                    self.label, self._draw_size, dsize))
                 self._gt = False
                 if self._cached.cached_texture is not None:
                     self._cached.cached_texture = None
@@ -163,7 +173,35 @@ def make_displayable(width, height, rgba):
         def visit(self):
             return []
 
-    return AtlasDisplayable(width, height, _png_rgba(width, height, rgba))
+    _TextureSource[0] = TextureSource
+    return TextureSource
+
+
+def make_displayable(width, height, rgba):
+    """Wrap packed atlas bytes as a texture source (needs a running game)."""
+
+    def load():
+        import io
+        import pygame
+        return pygame.image.load(io.BytesIO(_png_rgba(width, height, rgba)),
+                                 "atlas.png")
+
+    return _texture_source_class()(load, "atlas %dx%d" % (width, height))
+
+
+def image(path):
+    """Use an image file on disk as a texture source (needs a running game).
+
+    Loaded through Ren'Py so loose files and .rpa-packed ones behave the same,
+    and decoded once, on first render. This must be load_surface, not
+    load_image: the latter returns a Render whose get_size() yields floats,
+    and Render() with float dimensions faults hard."""
+    import renpy.display.im
+
+    def load():
+        return renpy.display.im.load_surface(path)
+
+    return _texture_source_class()(load, path.rsplit("/", 1)[-1])
 
 
 def pack16(v):
@@ -290,3 +328,19 @@ def attach(morph):
                                              morph["height"],
                                              morph["rgba"])
     return morph
+
+
+_placeholder = [None]
+
+
+def placeholder():
+    """One shared 1x1 white texture, built on first use.
+
+    Its job is positional: Ren'Py names a model's samplers by insertion order
+    (gl2draw binds uniforms["tex<i>"] for textures[i]), so filling slot 0 on
+    draws that have no morph atlas is what lets a material's own map rely on
+    being tex1 everywhere. It goes through the same pre-upload path as the
+    atlases, so it is immune to the window-scaling RTT as well."""
+    if _placeholder[0] is None:
+        _placeholder[0] = make_displayable(1, 1, "\xff" * 4)
+    return _placeholder[0]

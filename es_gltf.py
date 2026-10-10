@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """Minimal glTF 2.0 decoder for the es-3dmodels engine (.gltf + .glb).
 
-Covers what the engine consumes: POSITION / NORMAL / INDICES /
+Covers what the engine consumes: POSITION / NORMAL / INDICES / TEXCOORD_0 /
 JOINTS_0 / WEIGHTS_0, skins (joints + inverseBindMatrices), node TRS
 hierarchy, animation samplers, morph targets (incl. sparse accessors).
+One UV channel only: TEXCOORD_1..N exist in some assets and are ignored.
 Everything else (textures, PBR factors beyond base color) is ignored,
 never crashed on: unknown chunks raise ValueError with context, never
 segfault.
@@ -156,10 +157,11 @@ class Gltf(object):
         return out
 
     def primitives(self):
-        """Yields dicts: name, indices, POSITION/NORMAL/JOINTS_0/WEIGHTS_0
-        accessor ids (or None), material, node_matrix (or None), plus morph
-        data: targets (list of {semantic: accessor} or None), target_names
-        (mesh extras list or None), weights (mesh morph weights or None)."""
+        """Yields dicts: name, indices, POSITION/NORMAL/INDICES/TEXCOORD_0/
+        JOINTS_0/WEIGHTS_0 accessor ids (or None), material, node_matrix (or
+        None), plus morph data: targets (list of {semantic: accessor} or
+        None), target_names (mesh extras list or None), weights (mesh morph
+        weights or None)."""
         js = self.json
         node_of_mesh = {}
         for ni, node in enumerate(js.get("nodes", [])):
@@ -174,6 +176,7 @@ class Gltf(object):
                        "indices": p.get("indices"),
                        "position": at.get("POSITION"),
                        "normal": at.get("NORMAL"),
+                       "uv": at.get("TEXCOORD_0"),
                        "joints": at.get("JOINTS_0"),
                        "weights": at.get("WEIGHTS_0"),
                        "material": p.get("material"),
@@ -354,16 +357,25 @@ def split_by_joints(tris, joints, weights, cap=24):
 def bind_pose_mesh(gltf, target=300.0):
     """All meshes baked with their node transforms, fit into +-target/2.
 
-    Returns (verts, normals, tris) centered at origin, for rigid display.
+    Returns (verts, normals, tris, uvs) centered at origin, for rigid
+    display. `uvs` is None if ANY primitive lacks TEXCOORD_0: the attribute
+    layout is per-mesh, so UVs are all-or-nothing. Texture coordinates are
+    passed through in the file's own V convention -- only positions flip.
     """
     world = node_world_matrices(gltf)
     out_v = []
     out_n = []
     out_t = []
+    out_uv = []
     for p in gltf.primitives():
         pos = gltf.read_accessor(p["position"])
         nor = gltf.read_accessor(p["normal"]) if p["normal"] is not None else None
         idx = [int(x) for x in gltf.read_accessor(p["indices"])]
+        uv = gltf.read_accessor(p["uv"]) if p["uv"] is not None else None
+        if uv is None:
+            out_uv = None
+        elif out_uv is not None:
+            out_uv.extend(uv)
         mats = [world[ni] for ni in p["nodes"]] or [mat4_identity()]
         m = mats[0]
         base = len(out_v)
@@ -394,4 +406,4 @@ def bind_pose_mesh(gltf, target=300.0):
     out_v = [(x, -y, z) for (x, y, z) in out_v]
     out_n = [(x, -y, z) for (x, y, z) in out_n]
     out_t = [(a, c, b) for (a, b, c) in out_t]
-    return out_v, out_n, out_t
+    return out_v, out_n, out_t, out_uv

@@ -34,6 +34,7 @@ import es_gltf
 import es_obj
 import es_morph
 import es_caps
+import es_matlib
 
 print("ES_BUILD fit-space-palette")
 
@@ -41,8 +42,47 @@ _Matrix = renpy.display.matrix.Matrix
 
 
 def es_gltf_bind(path, target=300.0):
-    """Load a .gltf/.glb bind pose: (verts, normals, tris), fit to target."""
+    """Load a .gltf/.glb bind pose: (verts, normals, tris, uvs), fit to
+    target. `uvs` is None when a primitive has no TEXCOORD_0."""
     return es_gltf.bind_pose_mesh(es_gltf.Gltf.load(path), target)
+
+
+def define_material(name, fragment, params=None, requires=(), map_path=None,
+                    applies=None, blend="opaque", cutoff=None, cull=None):
+    """Author a shader recipe once; attach it anywhere with recipe="<name>".
+
+    The fragment assigns `es_color`; the engine emits the discard, the
+    premultiply and the write to gl_FragColor. It may read whatever the
+    vertex stage provides: v_normal, v_diff, v_half, v_pos (the rotated
+    position, which with u_eye_z gives a per-fragment view direction),
+    u_base_color, u_light_dir, u_view_dir, u_spin -- plus v_uv when the mesh
+    carries UVs.
+    Everything tunable goes through `params` (a float, or a 2-4 element
+    sequence); declarations are generated from those values.
+
+    `blend` is "opaque", "alpha clip" (discards below `cutoff`) or "alpha"
+    (blended, drawn in a second pass sorted farthest-first). `requires` names
+    geometry inputs checked per object; `map_path` binds an image as tex1;
+    `applies` is a glTF material name whose splits take this recipe; `cull`
+    "back" throws away fragments whose normal faces away from the viewer,
+    which is what stops a thin closed shell from shading itself twice.
+    Tune an object with `obj.material.set(name, value)`.
+
+    es-3dmodels/materials/*.mat is the preferred way to author: same backend,
+    real GLSL files, and errors that carry a file and line number."""
+    return es_shaders.define_recipe(name, fragment, params, requires,
+                                    map_path, applies, blend, cutoff, cull)
+
+
+def add_materials(prefix):
+    """Register a content mod's materials directory. Call from `init 10`.
+
+    `prefix` is the game-relative folder holding the .mat files, e.g.
+    "mods/es-3dmodels-matitan/materials". Returns the material names, which
+    objects then attach with recipe="<name>"; a recipe declaring `applies`
+    takes over that glTF material's splits with no call site at all.
+    """
+    return es_matlib.load_materials(define_material, prefix)
 
 
 # Global scene light. Materials with light_dir=None follow this;
@@ -51,13 +91,18 @@ LIGHT_DIR = (0.5, -0.8, 0.7)
 
 
 class Material(object):
-    """Surface + lighting preset. Flags select a compiled shader variant."""
+    """Surface + lighting preset. Flags select a compiled shader variant.
+
+    `recipe` names an authored fragment registered by define_material; its
+    parameters start at the recipe defaults and are tuned per instance with
+    set()."""
 
     def __init__(self, base_color=(0.9, 0.3, 0.3, 1.0),
                  light_dir=None,
                  shininess=16.0, ambient=0.3, diffuse=0.7,
                  spec_weight=0.5, specular=True, normal_viz=False,
-                 skinned=False, max_bones=None, bind_pose=False):
+                 skinned=False, max_bones=None, bind_pose=False,
+                 recipe=None):
         self.base_color = base_color
         self.light_dir = light_dir
         self.shininess = shininess
@@ -71,24 +116,75 @@ class Material(object):
         self.max_bones = (max_bones if max_bones is not None
                           else es_caps.max_bones())
         self.bind_pose = bind_pose
+        self.recipe = recipe
+        # draw() raises on any uniform the program declares and never gets,
+        # so every declared parameter carries a value from the start.
+        self.params = (dict(es_shaders.recipe_defaults(recipe))
+                       if recipe is not None else {})
+        self.map_path = (es_shaders.recipe_map(recipe)
+                         if recipe is not None else None)
+        # Blend mode belongs to the recipe, not the caller: it is a property
+        # of what the shader outputs.
+        self.blend = (es_shaders.recipe_blend(recipe)
+                      if recipe is not None else "opaque")
+        self.alpha_clip = (es_shaders.recipe_cutoff(recipe)
+                           if recipe is not None else 0.5)
+        self.cull = (es_shaders.recipe_cull(recipe)
+                     if recipe is not None else None)
+        self._map_source = None
+
+    def map_texture(self):
+        """This material's own map as a texture source, or None.
+
+        Built on first use so a recipe that is never attached neither
+        decodes nor uploads; the source keeps it at native resolution."""
+        if self.map_path is not None and self._map_source is None:
+            self._map_source = es_morph.image(self.map_path)
+        return self._map_source
+
+    def set(self, name, value):
+        """Tune one authored parameter: a float, or a 2-4 element sequence.
+
+        Rejecting an unknown name or a type that disagrees with the recipe's
+        declaration is deliberate -- Ren'Py's set_uniform ignores names the
+        program does not declare, so a typo would otherwise change nothing
+        and stay invisible."""
+        if self.recipe is None:
+            raise ValueError("Material.set: this material has no recipe")
+        types = es_shaders.recipe_types(self.recipe)
+        if name not in types:
+            raise ValueError("%s has no parameter %r (has: %s)"
+                             % (self.recipe, name, ", ".join(sorted(types))))
+        ptype = es_shaders.param_type(value)
+        if ptype != types[name]:
+            raise ValueError("%s.%s wants %s, got %r"
+                             % (self.recipe, name, types[name], value))
+        self.params[name] = value
+        return self
 
     def variant_key(self):
         return (bool(self.specular), bool(self.normal_viz),
                 float(self.shininess), float(self.ambient),
                 float(self.diffuse), float(self.spec_weight),
                 bool(self.skinned), int(self.max_bones),
-                bool(self.bind_pose))
+                bool(self.bind_pose), self.recipe, self.blend, self.cull)
 
-    def shader_name(self, morph=0):
-        # `morph` = active shape-key slot count; only split models with
-        # an atlas pass it (their shaders declare tex0/u_sw*).
+    def shader_name(self, morph=0, uvs=False):
+        # `morph` = active shape-key slot count, `uvs` = the mesh binds a_uv.
+        # Both are geometry facts, so the caller (a view, which knows its
+        # splits) passes them; only atlas-carrying splits pass a morph count.
+        if self.recipe is not None and not uvs:
+            if "uv" in es_shaders.recipe_requires(self.recipe):
+                raise ValueError("%s requires uv but this mesh carries none"
+                                 % self.recipe)
         try:
             return es_shaders.get_variant(
                 specular=self.specular, normal_viz=self.normal_viz,
                 shininess=self.shininess, ambient=self.ambient,
                 diffuse=self.diffuse, spec_weight=self.spec_weight,
                 skinned=self.skinned, max_bones=self.max_bones,
-                bind_pose=self.bind_pose, morph=morph)
+                bind_pose=self.bind_pose, morph=morph, uvs=uvs,
+                recipe=self.recipe, blend=self.blend, cull=self.cull)
         except Exception:
             return es_shaders.ensure_fallback()
 
@@ -108,6 +204,9 @@ class Object3D(object):
         self.verts = []
         self.normals = []
         self.tris = []
+        # One UV channel, or [] when the geometry carries no texture coords:
+        # a_uv is a per-mesh attribute, so it is all-or-nothing.
+        self.uvs = []
         self.mesh = None
         self._last_st = None
 
@@ -131,7 +230,14 @@ class Object3D(object):
 
     def build_mesh(self):
         v, n, t = self.centered()
-        self.mesh = es_step3.mesh3_from_lists(v, n, t)
+        if self.uvs:
+            # Layout order only has to agree with itself: the shader binds
+            # attributes by name through mesh.layout.offset.
+            self.mesh = es_step3.mesh3_from_layout(
+                v, [n, self.uvs], t,
+                [("a_normal", 3), ("a_uv", 2)])
+        else:
+            self.mesh = es_step3.mesh3_from_lists(v, n, t)
         return self.mesh
 
 
@@ -161,31 +267,35 @@ class CubeObject(Object3D):
 
 
 class MeshObject(Object3D):
-    """Geometry loaded from a Wavefront OBJ file. Animate via update()."""
+    """Loaded geometry (OBJ file or decoder lists). Animate via update()."""
 
     @classmethod
-    def from_data(cls, verts, normals, tris, size=500.0, speed=45.0,
-                  tilt=25.0, color=(0.85, 0.85, 0.9)):
+    def from_data(cls, verts, normals, tris, uvs=None, size=500.0,
+                  speed=45.0, tilt=25.0, color=(0.85, 0.85, 0.9),
+                  recipe=None):
         obj = cls(size=size, speed=speed, tilt=tilt,
                   material=Material(
-                      base_color=(color[0], color[1], color[2], 1.0)))
+                      base_color=(color[0], color[1], color[2], 1.0),
+                      recipe=recipe))
         obj.verts = list(verts)
         obj.normals = list(normals)
         obj.tris = list(tris)
+        obj.uvs = list(uvs) if uvs else []
         obj.build_mesh()
         return obj
 
     @classmethod
     def from_obj(cls, path, size=500.0, speed=60.0, tilt=25.0,
-                 color=(0.85, 0.85, 0.9), target=300.0):
+                 color=(0.85, 0.85, 0.9), target=300.0, recipe=None):
         obj = cls(size=size, speed=speed, tilt=tilt,
                   material=Material(
-                      base_color=(color[0], color[1], color[2], 1.0)))
-        verts, normals, tris = es_obj.load_obj(path, target)
-        for v, n in zip(verts, normals):
-            obj.verts.append(v)
-            obj.normals.append(n)
+                      base_color=(color[0], color[1], color[2], 1.0),
+                      recipe=recipe))
+        verts, normals, tris, uvs = es_obj.load_obj(path, target)
+        obj.verts = list(verts)
+        obj.normals = list(normals)
         obj.tris = list(tris)
+        obj.uvs = list(uvs) if uvs else []
         obj.build_mesh()
         return obj
 
@@ -201,16 +311,32 @@ class ObjectView(Displayable):
         self._sync_material()
 
     def _sync_material(self):
-        key = self.obj.material.variant_key()
+        # a_uv is a geometry fact the material's flags cannot see; it rides
+        # on the key so a UV-carrying mesh never reuses a non-UV program.
+        has_uvs = bool(self.obj.uvs)
+        key = self.obj.material.variant_key() + (has_uvs,)
         if key == self._shader_key and self.model is not None:
             return
         self._shader_key = key
         model = renpy.display.model.Model(size=(self.obj.size, self.obj.size))
         model.shader("renpy.geometry")
-        model.shader(self.obj.material.shader_name())
+        model.shader(self.obj.material.shader_name(uvs=has_uvs))
         model.property("depth", True)
+        material = self.obj.material
+        if material.blend == "alpha clip":
+            model.uniform("u_alpha_clip", material.alpha_clip)
+        elif material.blend == "alpha":
+            model.property("blend_func", renpy.config.gl_blend_func["normal"])
         model.uniform("u_view_dir", Object3D.view_dir)
-        model.uniform("u_base_color", self.obj.material.base_color)
+        model.uniform("u_base_color", material.base_color)
+        # Same slot discipline as the skinned path: a rigid draw has no
+        # atlas, so without this a material map would land on tex0 here but
+        # tex1 on a skinned split, and one authored fragment could not serve
+        # both.
+        model.texture(es_morph.placeholder())
+        texture = self.obj.material.map_texture()
+        if texture is not None:
+            model.texture(texture)
         model._mesh = self.obj.mesh
         self.model = model
 
@@ -222,10 +348,23 @@ class ObjectView(Displayable):
         obj.update(st, dt)
         self._sync_material()
         self.model.uniform("u_spin", obj.angle)
+        # The vertex stage rotates normals analytically, so it needs the same
+        # tilt the model matrix was built with -- a hardcoded one put the
+        # shading 25 degrees off any object that did not tilt by 25.
+        self.model.uniform("u_tilt", obj.tilt)
+        # Eye distance in buffer pixels, from the same perspective the
+        # transform is built with: v_pos + u_eye_z is what lets a fragment
+        # derive a per-pixel view vector, the only thing that gives a flat
+        # panel a gradient at all.
+        self.model.uniform("u_eye_z", renpy.config.perspective[1])
         self.model.uniform(
             "u_light_dir",
             obj.material.light_dir if obj.material.light_dir is not None
             else LIGHT_DIR)
+        for name, value in obj.material.params.items():
+            self.model.uniform(name, value)
+        if obj.material.blend == "alpha clip":
+            self.model.uniform("u_alpha_clip", obj.material.alpha_clip)
         turntable = Transform(
             self.model,
             matrixtransform=_Matrix.rotate(obj.tilt, obj.angle, 0.0),
@@ -442,25 +581,68 @@ def _fit_transforms(half_size, fit_scale, bounds_center):
                 away_from_pivot))
 
 
+def _view_depth(centroid, size, tilt, angle):
+    """Rotated z of a buffer-space point; larger is nearer the viewer.
+
+    Mirrors the rotation es_shaders._VERTEX applies to normals and the model
+    matrix the Transform builds, so the blended pass can be ordered
+    farthest-first without asking GL anything. Buffer verts sit around the
+    pivot, hence the half-size subtraction."""
+    import math
+    x = centroid[0] - size / 2.0
+    y = centroid[1] - size / 2.0
+    z = centroid[2]
+    sa = math.sin(math.radians(angle))
+    ca = math.cos(math.radians(angle))
+    sx = math.sin(math.radians(tilt))
+    cx = math.cos(math.radians(tilt))
+    return -sa * x + sx * ca * y + cx * ca * z
+
+
 class SkinnedObject(Object3D):
     """glTF mesh skinned on GPU. update() poses joints, view pushes palette."""
 
     def __init__(self, gltf, size=600.0, speed=30.0, tilt=25.0,
-                 color=(0.85, 0.8, 0.75), max_bones=None, target=300.0):
+                 color=(0.85, 0.8, 0.75), max_bones=None, target=300.0,
+                 recipe=None):
         import es_gltf
         if isinstance(gltf, basestring):
             gltf = es_gltf.Gltf.load(gltf)
         material = Material(
             base_color=(color[0], color[1], color[2], 1.0),
-            skinned=True, max_bones=max_bones)
+            skinned=True, max_bones=max_bones, recipe=recipe)
         super(SkinnedObject, self).__init__(size, speed, tilt, material)
         self.skel = Skeleton(gltf)
         self.splits = []
+        # A recipe that names a glTF material takes over that group's splits
+        # only; every other group keeps this object's material.
+        self.part_materials = self._part_materials(gltf)
         # Shape keys: name -> weight (active set), union of pool names.
         self.shapes = {}
         self.shape_names = []
         self._shape_seen = set()
         self._build_splits(gltf, target)
+
+    def _part_materials(self, gltf):
+        """{glTF material index: Material} for recipes declaring `applies`."""
+        by_name = {}
+        for index, entry in enumerate(gltf.json.get("materials", [])):
+            by_name[entry.get("name")] = index
+        found = {}
+        for recipe in es_shaders.RECIPES:
+            target = es_shaders.recipe_applies(recipe)
+            if target is None:
+                continue
+            index = by_name.get(target)
+            if index is None:
+                # A mistyped name would otherwise be ignored in silence.
+                print("ES_MAT %s applies to %r: no such material in this "
+                      "asset" % (recipe, target))
+                continue
+            found[index] = Material(
+                base_color=self.material.base_color, skinned=True,
+                max_bones=self.material.max_bones, recipe=recipe)
+        return found
 
     def set_shape(self, name, weight):
         """Set a shape key weight (typically 0..1). Names unknown to
@@ -485,11 +667,14 @@ class SkinnedObject(Object3D):
             indices = [int(x) for x in gltf.read_accessor(prim["indices"])]
             joint_rows = gltf.read_accessor(prim["joints"])
             weight_rows = gltf.read_accessor(prim["weights"], normalize=True)
+            uv_rows = (gltf.read_accessor(prim["uv"])
+                       if prim["uv"] is not None else None)
             node_matrix = (node_world[prim["nodes"][0]] if prim["nodes"]
                            else es_gltf.mat4_identity())
-            prim_data.append((positions, normals, indices, joint_rows,
-                              weight_rows, node_matrix, prim["material"],
-                              prim.get("targets"), prim.get("target_names")))
+            prim_data.append((positions, normals, uv_rows, indices,
+                              joint_rows, weight_rows, node_matrix,
+                              prim["material"], prim.get("targets"),
+                              prim.get("target_names")))
             for point in positions:
                 world_point = es_gltf.mat4_transform_point(node_matrix, point)
                 for axis in range(3):
@@ -511,7 +696,7 @@ class SkinnedObject(Object3D):
         # into one pool, then joint-split each pool. Fewer state changes
         # per material, and a home for future per-material maps.
         pools = {}
-        for (positions, normals, indices, joint_rows, weight_rows,
+        for (positions, normals, uv_rows, indices, joint_rows, weight_rows,
              node_matrix, material_id,
              morph_targets, morph_names) in prim_data:
             verts = []
@@ -528,8 +713,14 @@ class SkinnedObject(Object3D):
                     node_matrix, (normal[0] / length, normal[1] / length,
                                   normal[2] / length)))
             pool = pools.setdefault(material_id, {
-                "verts": [], "normals": [], "tris": [],
+                "verts": [], "normals": [], "uvs": [], "tris": [],
                 "joints": [], "weights": []})
+            if uv_rows is None:
+                # a_uv is one attribute buffer for the whole pool: mixing
+                # UV'd and bare primitives draws without UVs at all.
+                pool["uvs"] = None
+            elif pool["uvs"] is not None:
+                pool["uvs"].extend(uv_rows)
             if "morph_source" not in pool:
                 # Morph source for this pool: (node matrix, targets,
                 # target names). Merged multi-primitive pools clear it
@@ -556,6 +747,7 @@ class SkinnedObject(Object3D):
         for material_id, pool in ordered_pools:
             verts = pool["verts"]
             normals = pool["normals"]
+            uvs = pool["uvs"]
             tris = pool["tris"]
             joint_rows = pool["joints"]
             weight_rows = pool["weights"]
@@ -623,14 +815,28 @@ class SkinnedObject(Object3D):
                     part_weights[local_index] = weight_rows[global_index]
                 part_indices = [tuple(global_to_local[x] for x in tri)
                                 for tri in part_tris]
+                frames = [part_joint_ids, part_weights, part_normals,
+                          part_atlas_ids]
+                layout = [("a_joints", 4), ("a_weights", 4),
+                          ("a_norm3", 3), ("a_vid", 1)]
+                if uvs:
+                    # kept[local] == global, so the pool's UV list slices
+                    # straight into split order.
+                    frames.append([uvs[g] for g in kept])
+                    layout.append(("a_uv", 2))
                 mesh = es_step3.mesh3_from_layout(
-                    part_verts,
-                    [part_joint_ids, part_weights, part_normals,
-                     part_atlas_ids], part_indices,
-                    [("a_joints", 4), ("a_weights", 4), ("a_norm3", 3),
-                     ("a_vid", 1)])
+                    part_verts, frames, part_indices, layout)
+                count = float(len(part_verts))
+                # Buffer-space centroid: the transparent pass orders splits
+                # by how near this point ends up after the turn.
+                centroid = (sum(v[0] for v in part_verts) / count,
+                            sum(v[1] for v in part_verts) / count,
+                            sum(v[2] for v in part_verts) / count)
                 self.splits.append({"mesh": mesh, "joints": part_joints,
-                                    "model": None, "morph": morph})
+                                    "model": None, "morph": morph,
+                                    "uvs": bool(uvs), "centroid": centroid,
+                                    "material": self.part_materials.get(
+                                        material_id, self.material)})
         # The palette composes in this buffer space, not rig space: handing
         # the fit to the skeleton once is what keeps FIT out of every frame.
         self.skel.use_fit_space(self.fit, self.fit_inverse)
@@ -655,11 +861,13 @@ class SkinnedView(Displayable):
         for split in obj.splits:
             model = renpy.display.model.Model(size=(obj.size, obj.size))
             model.shader("renpy.geometry")
+            material = split["material"]
             morph = split["morph"]
             # Only atlas-carrying splits get the morph program: it alone
             # declares tex0/u_sw* (draw() raises on unset uniforms).
-            shader_name = obj.material.shader_name(
-                morph=(self.shape_slot_count if morph is not None else 0))
+            shader_name = material.shader_name(
+                morph=(self.shape_slot_count if morph is not None else 0),
+                uvs=bool(split["uvs"]))
             model.shader(shader_name)
             if morph is not None and not logged_morph_shader:
                 logged_morph_shader = True
@@ -671,18 +879,39 @@ class SkinnedView(Displayable):
             # Без личного depth: общий клеар — на родителе (см. render),
             # иначе каждый сплит чистит буфер и рушит окклюзию соседей.
             model.uniform("u_view_dir", Object3D.view_dir)
-            model.uniform("u_base_color", obj.material.base_color)
+            model.uniform("u_base_color", material.base_color)
+            # Slot 0 is always filled: the morph atlas where this pool has
+            # one, the shared 1x1 white texture otherwise. Ren'Py names
+            # samplers by insertion order, so filling it here is what lets a
+            # material's own map count on being tex1 on every split.
+            model.texture(morph["displayable"] if morph is not None
+                          else es_morph.placeholder())
+            texture = material.map_texture()
+            if texture is not None:
+                model.texture(texture)
             if morph is not None:
-                # Atlas must be texture 0: its sampler is named tex0.
-                model.texture(morph["displayable"])
                 model.uniform("u_mscale", morph["mscale"])
                 model.uniform("u_nscale", morph["nscale"])
                 model.uniform("u_nv", float(morph["nverts"]))
                 model.uniform("u_as", (float(morph["width"]),
                                        float(morph["height"])))
             model._mesh = split["mesh"]
+            if material.blend == "alpha":
+                # Ren'Py's "normal" blend is premultiplied (GL_ONE,
+                # GL_ONE_MINUS_SRC_ALPHA) and the generated fragment tail
+                # premultiplies es_color to match. Depth writes cannot be
+                # turned off -- glDepthMask is not bound in this build -- so
+                # these draws go last, farthest-first, in render().
+                model.property("blend_func",
+                               renpy.config.gl_blend_func["normal"])
             split["model"] = model
             self.models.append(model)
+        # Two ordered groups: opaque and alpha-clip write depth first, then
+        # the blended splits go over them farthest-first.
+        self.opaque_draws = [i for i, sp in enumerate(obj.splits)
+                             if sp["material"].blend != "alpha"]
+        self.blend_draws = [i for i, sp in enumerate(obj.splits)
+                            if sp["material"].blend == "alpha"]
 
     @staticmethod
     def _flatten(matrix):
@@ -715,7 +944,15 @@ class SkinnedView(Displayable):
             for local_index in range(len(split_joints), self.bone_count):
                 model.uniform("u_bone%d" % local_index, self._identity)
             model.uniform("u_spin", obj.angle)
+            model.uniform("u_tilt", obj.tilt)
+            model.uniform("u_eye_z", renpy.config.perspective[1])
             model.uniform("u_light_dir", light)
+            for name, value in split["material"].params.items():
+                model.uniform(name, value)
+            if split["material"].blend == "alpha clip":
+                # Pushed per frame rather than at build so the threshold is
+                # tunable live, like every other parameter.
+                model.uniform("u_alpha_clip", split["material"].alpha_clip)
             morph = split["morph"]
             if morph is not None:
                 # Active (row, weight) pairs for this pool's atlas,
@@ -741,8 +978,20 @@ class SkinnedView(Displayable):
         # Один depth-клеар на всех соседей: draw() чистит буфер в узле
         # с property depth и ставит has_depth наследникам — сплиты делят
         # один тест вместо чистки на каждый (иначе порядок неверный).
+        # That sharing is measured, not assumed: two quads at different Z
+        # blitted into one depth-enabled parent in either order produce
+        # byte-identical frames, so the blended splits can safely go last.
         rv.add_property("depth", True)
-        for split, model in zip(self.splits, self.models):
+        order = list(self.opaque_draws)
+        if self.blend_draws:
+            order.extend(sorted(self.blend_draws, key=lambda i: _view_depth(
+                self.splits[i]["centroid"], obj.size, obj.tilt, obj.angle)))
+            if not getattr(self, "_logged_order", False):
+                self._logged_order = True
+                print("ES_DBG_ORDER opaque=%r blended=%r (farthest first)" % (
+                    self.opaque_draws, order[len(self.opaque_draws):]))
+        for index in order:
+            model = self.models[index]
             drawn = renpy.display.render.render(
                 _TransformWrap(model, obj), obj.size, obj.size, st, at)
             rv.blit(drawn, (0, 0))
