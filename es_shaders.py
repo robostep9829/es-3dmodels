@@ -10,6 +10,7 @@ Hard lessons encoded here:
 - never redeclare renpy.geometry's u_transform / a_position / gl_Position.
 """
 import hashlib
+import re
 
 import renpy.display
 from renpy.gl2.gl2shadercache import register_shader
@@ -65,14 +66,20 @@ _RESERVED = ("u_transform", "u_base_color", "u_light_dir", "u_view_dir",
              "v_normal", "v_half", "v_diff", "v_pos", "a_position",
              "a_normal",
              "a_norm3", "a_joints", "a_weights", "a_vid", "a_uv",
-             "tex0", "tex1", "res0", "res1")
+             "a_tangent", "v_tangent",
+             "tex0", "tex1", "tex2", "res0", "res1", "res2")
 
 _VEC = {2: "vec2", 3: "vec3", 4: "vec4"}
 
 # Geometry inputs an authored fragment may declare it needs. Mirrors
 # es_matlib.FLAGS: both entry points guard themselves, because the .mat path
 # wants line numbers and the Python API must not be able to skip the check.
-RECIPE_FLAGS = ("uv",)
+RECIPE_FLAGS = ("uv", "tangent")
+
+# Sampler slots an authored fragment may read, and the recipe field that puts
+# a texture behind each name. tex0 is engine-owned (the morph atlas or the
+# placeholder that keeps slot 0 free for it), so it is not in this table.
+SAMPLER_SOURCES = {"1": "map", "2": "normal_map"}
 
 # Traditional material blend modes, named as most engines name them.
 #   opaque      -- writes colour, no discard, first pass
@@ -127,7 +134,8 @@ def param_type(value):
 
 
 def define_recipe(name, fragment, params=None, requires=(), map_path=None,
-                  applies=None, blend="opaque", cutoff=None, cull=None):
+                  applies=None, blend="opaque", cutoff=None, cull=None,
+                  normal_map=None):
     """Register an author-written fragment and the parameters it exposes.
 
     Authored text supplies the body of the fragment function only: it assigns
@@ -137,9 +145,12 @@ def define_recipe(name, fragment, params=None, requires=(), map_path=None,
     hand-written declaration would collide with the block this builds, and
     ShaderPart drops declarations whose name appears nowhere.
 
-    `requires` names geometry inputs ("uv"), checked against the mesh by
-    Material.shader_name. `map_path` binds an image as tex1 and legalises
-    texture2D. `applies` is a glTF material name whose splits take this
+    `requires` names geometry inputs ("uv", "tangent"), checked against the
+    mesh by Material.shader_name. `map_path` binds an image as tex1.
+    `normal_map` binds a tangent-space normal map as tex2 and makes the engine
+    bake a_tangent for this material's mesh -- tangents are geometry, and which
+    geometry gets them is decided here (see es_tangent for why they cannot come
+    from derivatives). `applies` is a glTF material name whose splits take this
     recipe. `blend` is one of BLEND_MODES; `cutoff` needs "alpha clip";
     `cull` is one of CULL_MODES or None.
     """
@@ -168,13 +179,25 @@ def define_recipe(name, fragment, params=None, requires=(), map_path=None,
         if head.startswith(("uniform ", "attribute ", "varying ")):
             raise ValueError("%s: fragment declares %r -- declare it through "
                              "params= instead" % (name, head[:48]))
-        if "tex0" in head:
-            raise ValueError("%s: tex0 is the engine's morph atlas or "
-                             "placeholder; a material's own map is tex1"
-                             % name)
-        if ("texture2D" in head or "tex1" in head) and map_path is None:
-            raise ValueError("%s: fragment samples a texture but declares no "
-                             "map, so nothing is bound at tex1" % name)
+    # Sampler names are the slots, so which map a fragment reads is a fact the
+    # recipe can check rather than one the linker discovers: tex1 is `map`,
+    # tex2 is `normal_map`, and an undeclared source would leave the sampler
+    # declaration out of the program entirely.
+    sources = {"map": map_path, "normal_map": normal_map}
+    for slot in sorted(set(re.findall(r"\btex(\d+)\b", fragment))):
+        field = SAMPLER_SOURCES.get(slot)
+        if field is None:
+            if slot == "0":
+                raise ValueError("%s: fragment reads tex0, which is the "
+                                 "engine's morph atlas or placeholder, not an "
+                                 "authoring surface (a material's map is tex1, "
+                                 "its normal map tex2)" % name)
+            raise ValueError("%s: fragment reads tex%s, but only tex1 (map) "
+                             "and tex2 (normal_map) exist" % (name, slot))
+        if sources[field] is None:
+            raise ValueError("%s: fragment reads tex%s but declares no %s, so "
+                             "nothing is bound at that slot"
+                             % (name, slot, field))
     types = {}
     for pname, value in params.items():
         ptype = param_type(value)
@@ -189,9 +212,17 @@ def define_recipe(name, fragment, params=None, requires=(), map_path=None,
         if flag not in RECIPE_FLAGS:
             raise ValueError("%s: unknown requirement %r (known: %s)"
                              % (name, flag, ", ".join(sorted(RECIPE_FLAGS))))
+    requires = set(requires)
+    if normal_map is not None:
+        # A tangent-space map cannot be read without the UV that samples it or
+        # the tangent that orients it, and both are geometry the engine has to
+        # provide -- so declaring the map claims both requirements rather than
+        # asking the author to remember them.
+        requires.update(("uv", "tangent"))
     RECIPES[name] = {"fragment": fragment, "params": dict(params),
                      "types": types, "requires": frozenset(requires),
-                     "map": map_path, "applies": applies, "blend": blend,
+                     "map": map_path, "normal_map": normal_map,
+                     "applies": applies, "blend": blend,
                      "cutoff": cutoff, "cull": cull}
     return name
 
@@ -206,6 +237,10 @@ def recipe_requires(name):
 
 def recipe_map(name):
     return RECIPES[name]["map"]
+
+
+def recipe_normal_map(name):
+    return RECIPES[name]["normal_map"]
 
 
 def recipe_applies(name):
@@ -274,14 +309,16 @@ def _recipe_declares(name):
     """
     lines = ["uniform %s %s;" % (t, n)
              for n, t in sorted(RECIPES[name]["types"].items())]
-    if RECIPES[name]["map"] is not None:
-        # tex1 is the material's own map -- slot 0 is always the atlas or the
-        # placeholder, so this is where a bound image lands. res1 arrives
-        # free: UniformSampler2D.assign sets the uniform named
-        # "res<sampler>" to the texture's pixel size, and an author cannot
-        # declare it by hand because fragment declarations are rejected.
-        # ShaderPart drops either one if the fragment never mentions it.
-        lines = lines + ["uniform sampler2D tex1;", "uniform vec2 res1;"]
+    for slot, field in sorted(SAMPLER_SOURCES.items()):
+        # Slot numbers are names here: gl2draw binds uniforms["tex<i>"] from
+        # the i-th model.texture(), so a recipe that declares tex2 must also
+        # have something inserted at index 2 (the views keep slot 1 filled with
+        # the same 1x1 placeholder that keeps slot 0 filled, for exactly this
+        # reason). res<sampler> arrives free when Ren'Py's own sampler index
+        # matches the slot name -- see the caveat in MATERIALS.md.
+        if RECIPES[name][field] is not None:
+            lines = lines + ["uniform sampler2D tex%s;" % slot,
+                             "uniform vec2 res%s;" % slot]
     return "\n" + "\n".join(lines) + "\n"
 
 
@@ -328,6 +365,18 @@ _NORMAL_DECL = "attribute vec3 %s;\n"
 _UV_DECL = "\nattribute vec2 a_uv;\nvarying vec2 v_uv;\n"
 _UV_PASS = """
 v_uv = a_uv;
+"""
+
+# Tangents are an attribute because this pipeline cannot get one any other way
+# (see es_tangent). v_tangent carries w through untouched: it is a handedness
+# flag, not a direction, so no transform touches it -- the object rotation is a
+# proper rotation and the skin matrices compose to det +1, which is what keeps
+# cross(N, T) pointing the same way as the baked bitangent.
+_TANGENT_DECL = "\nattribute vec4 a_tangent;\nvarying vec4 v_tangent;\n"
+_TANGENT_PASS = """
+vec3 skT = %(src)s;
+v_tangent = vec4(normalize(vec3(dot(u_n0, skT), dot(u_n1, skT),
+                               dot(u_n2, skT))), a_tangent.w);
 """
 
 _VERTEX_RIGID = """
@@ -478,7 +527,6 @@ def _validate(name, source):
         raise ValueError("%s: unbalanced braces" % name)
     if source.count("(") != source.count(")"):
         raise ValueError("%s: unbalanced parens" % name)
-    import re
     if re.search(r"vec3\s+\w+\s*=\s*a_position\s*;", source):
         raise ValueError("%s: vec4 a_position assigned to vec3 "
                          "(use a_position.xyz)" % name)
@@ -512,12 +560,16 @@ def _skin_pick(n):
 def get_variant(specular=True, normal_viz=False, shininess=16.0,
                 ambient=0.3, diffuse=0.7, spec_weight=0.5,
                 skinned=False, max_bones=24, bind_pose=False,
-                morph=0, uvs=False, recipe=None, blend="opaque", cull=None):
+                morph=0, uvs=False, recipe=None, blend="opaque", cull=None,
+                tangents=False):
     """Return a registered shader name for this feature combination.
 
     `morph` is the number of active shape-key slots (0 = no morphs).
     Morphs need the skinned path (a_vid lives in the split layout);
-    ignored for rigid variants. `uvs` declares and forwards a_uv.
+    ignored for rigid variants. `uvs` declares and forwards a_uv, `tangents`
+    a_tangent. Both are mesh facts, not material ones: draw() raises when a
+    program asks for an attribute the bound layout does not carry, so a
+    program that binds a_tangent is only ever handed a mesh that has it.
     `recipe` replaces the fragment with an authored one and adds its
     parameter declarations; the lighting flags then decide nothing, and
     `blend` and `cull` give that recipe its discard, premultiply and
@@ -538,7 +590,7 @@ def get_variant(specular=True, normal_viz=False, shininess=16.0,
     key = (bool(specular), bool(normal_viz), float(shininess),
            float(ambient), float(diffuse), float(spec_weight),
            bool(skinned), int(max_bones), bool(bind_pose), morph,
-           bool(uvs), recipe, digest, blend, cull)
+           bool(uvs), bool(tangents), recipe, digest, blend, cull)
     if key in VARIANTS:
         return VARIANTS[key]
     if recipe is not None:
@@ -581,7 +633,16 @@ def get_variant(specular=True, normal_viz=False, shininess=16.0,
         skin = _VERTEX_RIGID
     if uvs:
         variables = variables + _UV_DECL
-    vertex = (prelude + skin + (_UV_PASS if uvs else "") + "\n" + _VERTEX)
+    vertex = (prelude + skin + (_UV_PASS if uvs else ""))
+    if tangents:
+        # The same mat3(es_sm) that carries a_norm3 carries the tangent, so a
+        # joint rotation turns the basis with the surface instead of leaving it
+        # behind at the bind pose.
+        variables = variables + _TANGENT_DECL
+        vertex = vertex + (_TANGENT_PASS % {
+            "src": ("mat3(es_sm) * a_tangent.xyz"
+                    if (skinned and not bind_pose) else "a_tangent.xyz")})
+    vertex = vertex + "\n" + _VERTEX
     label = recipe or "es_mat3"
     _validate(label + ".vertex", vertex)
     _validate(label + ".fragment", fragment)

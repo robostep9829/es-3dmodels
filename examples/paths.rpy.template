@@ -116,6 +116,25 @@ init 10 python:
             o.material.normal_viz = True
             return o
 
+        # --- 8. normal maps -------------------------------------------
+        # Not run here because it needs a map file, which this template has
+        # none of. The shape of it is one statement and five lines of decode:
+        #
+        #     normal_map "textures/body_normal.png"   # in the .mat
+        #
+        #     vec3 N = normalize(v_normal);
+        #     vec3 T = normalize(v_tangent.xyz);
+        #     vec3 B = cross(N, T) * v_tangent.w;
+        #     vec3 bump = (texture2D(tex2, v_uv).xyz - 0.5) * 2.0;
+        #     vec3 P = normalize(T * bump.x + B * bump.y + N * bump.z);
+        #
+        # `normal_map` implies `requires uv` and `requires tangent` and makes
+        # the loader bake tangents for the mesh that takes the material. Light
+        # P, not v_diff: v_diff is per-vertex, so a per-pixel normal would have
+        # nothing to act on. The full convention, and the one parameter a
+        # DirectX map needs, are in MATERIALS.md; the working instance is
+        # materials/body_diffuse.mat in the matitan content mod.
+
 
 label es_paths:
     if not ES_PATHS_OK:

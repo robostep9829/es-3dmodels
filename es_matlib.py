@@ -11,6 +11,7 @@
     material body_diffuse {
         fragment "body.glsl"
         map "textures/body.png"               # bound as tex1
+        normal_map "textures/body_normal.png" # bound as tex2
         applies "mtl_bdy1062_00"              # only this glTF material
         blend "alpha clip"                    # opaque | alpha clip | alpha
         cutoff 0.5
@@ -27,7 +28,12 @@ including the Python API, so neither path can be bypassed.
 import re
 
 TYPES = {"float": 1, "vec2": 2, "vec3": 3, "vec4": 4}
-FLAGS = ("uv",)
+FLAGS = ("uv", "tangent")
+# Mirrors es_shaders.SAMPLER_SOURCES: a slot number is only readable if the
+# material declared the map that fills it. Kept as a keyword table so an error
+# can name the statement the author has to write, and so this module stays
+# importable without Ren'Py.
+SAMPLER_KEYWORDS = {"1": "map", "2": "normal_map"}
 # Mirrors es_shaders.BLEND_MODES: this copy exists so a bad blend name is
 # reported with its .mat line number, and the parser stays importable without
 # Ren'Py (es_shaders cannot be imported outside a running game).
@@ -137,7 +143,7 @@ def _first_line(text, needle):
     return 1
 
 
-def _check_fragment(name, frag_path, text, requires, has_map):
+def _check_fragment(name, frag_path, text, requires, map_path, normal_path):
     """Source checks that pay for themselves by naming a line number."""
     for number, line in enumerate(text.split("\n"), 1):
         where = "%s:%d" % (frag_path, number)
@@ -156,26 +162,38 @@ def _check_fragment(name, frag_path, text, requires, has_map):
             raise MaterialError("%s: declares %r; parameters belong in the "
                                 ".mat, which generates this block"
                                 % (where, code[:48]))
-        if "tex0" in code:
-            raise MaterialError("%s: tex0 is the engine's morph atlas or "
-                                "placeholder, not an authoring surface; a "
-                                "material's own map is tex1" % where)
-        if ("texture2D" in code or "tex1" in code) and not has_map:
-            raise MaterialError("%s: samples a texture but %s declares no map "
-                                "(nothing is bound at tex1)"
-                                % (where, name))
+        for slot in re.findall(r"\btex(\d+)\b", code):
+            keyword = SAMPLER_KEYWORDS.get(slot)
+            if keyword is None:
+                raise MaterialError("%s: reads tex%s, which is not a surface a "
+                                    "material gets (tex1 = map, tex2 = "
+                                    "normal_map)" % (where, slot))
+            filled = map_path if slot == "1" else normal_path
+            if filled is None:
+                raise MaterialError("%s: reads tex%s but %s declares no %s, so "
+                                    "nothing is bound at that slot"
+                                    % (where, slot, name, keyword))
     if "es_color" not in text:
         raise MaterialError("%s: material %s never assigns es_color, so "
                             "nothing it computes reaches the screen"
                             % (frag_path, name))
-    reads_uv = "v_uv" in text
-    if reads_uv and "uv" not in requires:
-        raise MaterialError("%s:%d: material %s reads v_uv but does not "
-                            "declare 'requires uv'"
-                            % (frag_path, _first_line(text, "v_uv"), name))
-    if "uv" in requires and not reads_uv:
-        raise MaterialError("%s: material %s declares 'requires uv' but never "
-                            "reads v_uv" % (frag_path, name))
+    for flag, needle in (("uv", "v_uv"), ("tangent", "v_tangent")):
+        reads = needle in text
+        if reads and flag not in requires:
+            if flag == "tangent" and normal_path is not None:
+                # normal_map claims the tangent requirement itself: a map in
+                # tangent space is meaningless without the basis, and making
+                # the author remember to write both would only let them write
+                # one of the two.
+                continue
+            line = _first_line(text, needle)
+            raise MaterialError("%s:%d: material %s reads %s but does not "
+                                "declare 'requires %s'"
+                                % (frag_path, line, name, needle, flag))
+        if reads is False and flag in requires:
+            raise MaterialError("%s: material %s declares 'requires %s' but "
+                                "never reads %s" % (frag_path, name, flag,
+                                                    needle))
 
 
 def _string_arg(name, lineno, toks, path, keyword):
@@ -189,6 +207,7 @@ def _string_arg(name, lineno, toks, path, keyword):
 def _material(name, decl_line, stmts, path, base, read):
     relpath = None
     map_rel = None
+    normal_rel = None
     applies = None
     blend = None
     blend_line = 0
@@ -208,6 +227,11 @@ def _material(name, decl_line, stmts, path, base, read):
             if map_rel is not None:
                 raise _at(path, lineno, "material %s: map given twice" % name)
             map_rel = _string_arg(name, lineno, toks, path, "map")
+        elif key == "normal_map":
+            if normal_rel is not None:
+                raise _at(path, lineno,
+                          "material %s: normal_map given twice" % name)
+            normal_rel = _string_arg(name, lineno, toks, path, "normal_map")
         elif key == "applies":
             if applies is not None:
                 raise _at(path, lineno, "material %s: applies given twice"
@@ -268,23 +292,25 @@ def _material(name, decl_line, stmts, path, base, read):
     # a view is built. load_materials checks it resolves, es_morph.image()
     # decodes it on first render.
     map_path = (base + map_rel) if map_rel is not None else None
+    normal_path = (base + normal_rel) if normal_rel is not None else None
     if cutoff is not None and blend not in (None, "alpha clip"):
         raise _at(path, cutoff_line, "material %s: cutoff needs "
                                     "blend \"alpha clip\", not %r"
                   % (name, blend))
-    _check_fragment(name, frag_path, text, requires, map_path is not None)
+    _check_fragment(name, frag_path, text, requires, map_path, normal_path)
     return {"name": name, "fragment": text, "params": params,
-            "requires": requires, "map": map_path, "applies": applies,
-            "blend": blend or "opaque", "cutoff": cutoff, "cull": cull,
-            "source": path}
+            "requires": requires, "map": map_path, "normal_map": normal_path,
+            "applies": applies, "blend": blend or "opaque", "cutoff": cutoff,
+            "cull": cull, "source": path}
 
 
 def parse(text, path, read):
     """Parse .mat source into recipe dicts.
 
     `read(relpath)` returns a fragment file's contents for a path resolved
-    against `path`'s directory. Returns a list of
-    {name, fragment, params, requires, source}.
+    against `path`'s directory. Returns a list of recipe dicts: {name,
+    fragment, params, requires, map, normal_map, applies, blend, cutoff,
+    cull, source}.
     """
     lines = text.split("\n")
     total = len(lines)
@@ -342,22 +368,26 @@ def load_materials(define, prefix):
     "mods/es-3dmodels-matitan/materials" -- materials belong to the content
     mod that ships them, so there is no engine default.
     `define(name, fragment, params, requires, map_path, applies, blend,
-    cutoff, cull)` is the recipe backend: es_engine.define_material in the
-    game, a test double in unit tests. Returns the registered material names.
+    cutoff, cull, normal_map)` is the recipe backend: es_engine.define_material
+    in the game, a test double in unit tests. Returns the registered material
+    names.
     """
     import renpy
     loaded = []
     for path in discover(prefix):
         recipes = parse(_read_file(path), path, _read_file)
         for recipe in recipes:
-            if recipe["map"] is not None and not renpy.loader.loadable(
-                    recipe["map"]):
-                raise _at(path, 0, "material %s: map %s is not a loadable "
-                                   "file" % (recipe["name"], recipe["map"]))
+            for keyword in ("map", "normal_map"):
+                image = recipe[keyword]
+                if image is not None and not renpy.loader.loadable(image):
+                    raise _at(path, 0, "material %s: %s %s is not a loadable "
+                                       "file" % (recipe["name"], keyword,
+                                                 image))
             try:
                 define(recipe["name"], recipe["fragment"], recipe["params"],
                        recipe["requires"], recipe["map"], recipe["applies"],
-                       recipe["blend"], recipe["cutoff"], recipe["cull"])
+                       recipe["blend"], recipe["cutoff"], recipe["cull"],
+                       recipe["normal_map"])
             except Exception as error:
                 raise _at(path, 0, "material %s rejected by the shader "
                                    "backend: %s" % (recipe["name"], error))

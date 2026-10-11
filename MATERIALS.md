@@ -43,11 +43,13 @@ paths run every check below, so neither can skip them.
     material <name> {
         fragment "<file.glsl>"          # required, read next to the .mat
         map "<image.png>"               # optional, bound as tex1
+        normal_map "<image.png>"        # optional, tangent-space map, tex2
         applies "<glTF material name>"  # optional, auto-attach target
         blend "opaque|alpha clip|alpha" # optional, default "opaque"
         cutoff <float strictly 0..1>    # optional, needs blend "alpha clip"
         cull "back"                     # optional, default: cull nothing
         requires uv                     # optional, geometry inputs needed
+        requires tangent                # optional (normal_map implies it)
         float u_x = 1.0                 # typed parameters, with defaults
         vec2  u_p = 0.5 0.5
         vec3  u_tint = 1.0 1.0 1.0
@@ -84,7 +86,19 @@ Available to it:
 | `u_view_dir` | the fixed view direction, `(0, 0, 1)` |
 | `u_base_color` | the object's base colour, straight alpha |
 | `v_uv` | `TEXCOORD_0`, only with `requires uv` |
-| `tex1`, `res1` | the material's own `map`, and its size in pixels |
+| `v_tangent` | baked tangent `xyz` plus handedness in `w`, only with `requires tangent` |
+| `tex1` | the material's own `map` |
+| `tex2` | the material's `normal_map` |
+| `res1`, `res2` | a map's size in pixels — **see the caveat before using these** |
+
+`res<N>` is set by Ren'Py, not by this engine, and it is keyed to the order in
+which the program *discovers* its samplers rather than to the slot number in its
+name (`UniformSampler2D.assign` writes `"res" + str(self.sampler)`). Those agree
+only when every lower slot is also declared, which holds on a split that binds
+the morph atlas and fails on one that does not — four of the matitan model's nine
+splits, including the body. A fragment that reads `res1` therefore works on the
+face and breaks on the dress. Compute a texel size from a parameter you declare
+yourself, or do not use `res<N>` at all.
 
 `v_pos` and `u_eye_z` together are what give a **per-fragment** view direction:
 
@@ -105,6 +119,64 @@ A worked example, a glossy translucent white panel:
     vec3 base = u_tint * (u_ambient + (1.0 - u_ambient) * v_diff);
     float hi = clamp(u_spec * spec + u_rim * fres, 0.0, 1.0);
     es_color = vec4(mix(base, vec3(1.0), hi), u_opacity);
+
+
+## Normal maps
+
+`normal_map` binds an image as `tex2` and does two more things silently, both
+of them required:
+
+- it implies `requires uv` and `requires tangent`, so the mesh that takes this
+  material gets per-vertex tangents baked for it at load time (`es_tangent.py`:
+  per-face tangents from the UV deltas, accumulated per vertex, orthogonalised
+  against the normal, handedness in `w`), and
+- it makes the views fill sampler slot 1 with the shared 1x1 placeholder even
+  when the material declares no `map`, so `tex2` really is slot 2.
+
+Tangents have to be geometry here. A derivative tangent space needs
+`dFdx`/`dFdy`, which in GLSL ES 1.00 needs an extension directive, and there is
+no legal place to put one: Ren'Py emits its `precision` prelude before the mod's
+function slot, and `ShaderPart` reads `variables` one three-token line at a
+time.
+
+The decode, and the only form that matches what the engine bakes:
+
+    vec3 N = normalize(v_normal);
+    vec3 T = normalize(v_tangent.xyz);
+    vec3 B = cross(N, T) * v_tangent.w;
+    vec3 bump = (texture2D(tex2, v_uv).xyz - 0.5) * 2.0;
+    vec3 P = normalize(T * bump.x + B * bump.y + N * bump.z);
+
+That basis is glTF 2.0's, which is the convention the assets in this set are
+authored under: `w` says whether `cross(N, T)` points along the baked
+bitangent, and a U/V swap or a Y-flipped buffer space both flip it. The engine
+bakes in the space the mesh is uploaded in, not in rig space, for exactly that
+reason.
+
+**Green is up.** A DirectX (green-down) map needs its Y negated, and the way to
+say that per material is a `vec3` strength parameter rather than a second
+fragment:
+
+    vec3 u_normal_scale = 1.0 1.0 1.0    # .mat: (1.0, -1.0, 1.0) for DirectX
+
+The matitan body map (`textures/mtl_bdy1062_00_normal.png`) is green-up: with
+the light moved to straight up-screen, its frill lobes and stitched hem band
+brighten along their top edges unflipped and along their bottom edges flipped.
+The same parameter is also the strength knob — this map is subtle (90% of its
+texels sit within 8/255 of neutral), so `1.0` reads as almost nothing.
+
+Light the perturbed normal, not `v_diff`. `v_diff` is one `dot(N, L)` evaluated
+per **vertex**, so reusing it leaves a per-pixel normal with nothing to act on
+and the map contributes no detail at all:
+
+    float light = u_ambient + (1.0 - u_ambient) * max(dot(P, normalize(u_light_dir)), 0.0);
+
+What the pipeline guarantees, measured rather than assumed: with a neutral
+`(128, 128, 255)` map the decode is an exact identity — the render is
+byte-identical to the same material with no `normal_map` at all — and on a flat
+panel with a known UV layout the four test maps produce the values the formula
+above predicts to the byte, including the mirrored-UV case that only comes out
+right if `w` is correct.
 
 
 ## Blend modes
@@ -156,12 +228,13 @@ in the parser rather than at compile time.
   a hand-written one is also how you silently lose a uniform.)
 - **No `tex0`.** Slot 0 is the engine's morph atlas or 1x1 placeholder; a
   material's own map is always `tex1`.
-- **Sampling needs `map`.** `texture2D` or `tex1` without a declared `map`
-  means nothing is bound.
+- **Every sampler needs the statement that fills it.** `tex1` needs `map`,
+  `tex2` needs `normal_map`, and no other `texN` is a surface a material gets.
 - **`es_color` must be assigned.** Otherwise nothing you compute reaches the
   screen.
-- **`v_uv` needs `requires uv`, and `requires uv` needs a `v_uv` read.** Both
-  directions are checked, so a stale requirement cannot linger.
+- **`v_uv` needs `requires uv`, `v_tangent` needs `requires tangent`** — and a
+  declared requirement nothing reads is an error too, in both directions, so a
+  stale one cannot linger. `normal_map` claims both for itself.
 - **`cutoff` needs `blend "alpha clip"`.**
 
 `es_matlib.parse()` imports no Ren'Py and takes a `read` callback, so the

@@ -33,6 +33,7 @@ import es_shaders
 import es_gltf
 import es_obj
 import es_morph
+import es_tangent
 import es_caps
 import es_matlib
 
@@ -48,30 +49,33 @@ def es_gltf_bind(path, target=300.0):
 
 
 def define_material(name, fragment, params=None, requires=(), map_path=None,
-                    applies=None, blend="opaque", cutoff=None, cull=None):
+                    applies=None, blend="opaque", cutoff=None, cull=None,
+                    normal_map=None):
     """Author a shader recipe once; attach it anywhere with recipe="<name>".
 
     The fragment assigns `es_color`; the engine emits the discard, the
     premultiply and the write to gl_FragColor. It may read whatever the
     vertex stage provides: v_normal, v_diff, v_half, v_pos (the rotated
     position, which with u_eye_z gives a per-fragment view direction),
-    u_base_color, u_light_dir, u_view_dir -- plus v_uv when the mesh carries
-    UVs.
+    v_tangent when the mesh has baked tangents, u_base_color, u_light_dir,
+    u_view_dir -- plus v_uv when the mesh carries UVs.
     Everything tunable goes through `params` (a float, or a 2-4 element
     sequence); declarations are generated from those values.
 
     `blend` is "opaque", "alpha clip" (discards below `cutoff`) or "alpha"
     (blended, drawn in a second pass sorted farthest-first). `requires` names
     geometry inputs checked per object; `map_path` binds an image as tex1;
-    `applies` is a glTF material name whose splits take this recipe; `cull`
-    "back" throws away fragments whose normal faces away from the viewer,
-    which is what stops a thin closed shell from shading itself twice.
-    Tune an object with `obj.material.set(name, value)`.
+    `normal_map` binds a tangent-space normal map as tex2 and makes this
+    material's mesh bake tangents; `applies` is a glTF material name whose
+    splits take this recipe; `cull` "back" throws away fragments whose normal
+    faces away from the viewer, which is what stops a thin closed shell from
+    shading itself twice. Tune an object with `obj.material.set(name, value)`.
 
     es-3dmodels/materials/*.mat is the preferred way to author: same backend,
     real GLSL files, and errors that carry a file and line number."""
     return es_shaders.define_recipe(name, fragment, params, requires,
-                                    map_path, applies, blend, cutoff, cull)
+                                    map_path, applies, blend, cutoff, cull,
+                                    normal_map)
 
 
 def add_materials(prefix):
@@ -131,7 +135,10 @@ class Material(object):
                            if recipe is not None else 0.5)
         self.cull = (es_shaders.recipe_cull(recipe)
                      if recipe is not None else None)
+        self.normal_path = (es_shaders.recipe_normal_map(recipe)
+                            if recipe is not None else None)
         self._map_source = None
+        self._normal_source = None
 
     def map_texture(self):
         """This material's own map as a texture source, or None.
@@ -141,6 +148,22 @@ class Material(object):
         if self.map_path is not None and self._map_source is None:
             self._map_source = es_morph.image(self.map_path)
         return self._map_source
+
+    def normal_texture(self):
+        """This material's tangent-space normal map, or None."""
+        if self.normal_path is not None and self._normal_source is None:
+            self._normal_source = es_morph.image(self.normal_path)
+        return self._normal_source
+
+    def wants_tangents(self):
+        """True when this material's recipe reads a tangent-space basis.
+
+        Tangents are geometry the mesh has to carry, so this is what decides
+        whether the loader bakes them -- `normal_map` implies the requirement
+        on the recipe, which is why nothing here asks the author twice."""
+        if self.recipe is None:
+            return False
+        return "tangent" in es_shaders.recipe_requires(self.recipe)
 
     def set(self, name, value):
         """Tune one authored parameter: a float, or a 2-4 element sequence.
@@ -169,14 +192,22 @@ class Material(object):
                 bool(self.skinned), int(self.max_bones),
                 bool(self.bind_pose), self.recipe, self.blend, self.cull)
 
-    def shader_name(self, morph=0, uvs=False):
-        # `morph` = active shape-key slot count, `uvs` = the mesh binds a_uv.
-        # Both are geometry facts, so the caller (a view, which knows its
-        # splits) passes them; only atlas-carrying splits pass a morph count.
-        if self.recipe is not None and not uvs:
-            if "uv" in es_shaders.recipe_requires(self.recipe):
-                raise ValueError("%s requires uv but this mesh carries none"
-                                 % self.recipe)
+    def shader_name(self, morph=0, uvs=False, tangents=False):
+        # `morph` = active shape-key slot count, `uvs` = the mesh binds a_uv,
+        # `tangents` = it binds a_tangent. All three are geometry facts, so the
+        # caller (a view, which knows its splits) passes them; only
+        # atlas-carrying splits pass a morph count. Checking them here rather
+        # than letting the program build is deliberate: draw() raises on an
+        # attribute the bound layout does not carry, and that is a crash in the
+        # middle of a frame with no material named in it.
+        if self.recipe is not None:
+            requires = es_shaders.recipe_requires(self.recipe)
+            for flag, present, what in (("uv", uvs, "UVs"),
+                                        ("tangent", tangents,
+                                         "baked tangents")):
+                if flag in requires and not present:
+                    raise ValueError("%s requires %s but this mesh has no %s"
+                                     % (self.recipe, flag, what))
         try:
             return es_shaders.get_variant(
                 specular=self.specular, normal_viz=self.normal_viz,
@@ -184,7 +215,8 @@ class Material(object):
                 diffuse=self.diffuse, spec_weight=self.spec_weight,
                 skinned=self.skinned, max_bones=self.max_bones,
                 bind_pose=self.bind_pose, morph=morph, uvs=uvs,
-                recipe=self.recipe, blend=self.blend, cull=self.cull)
+                recipe=self.recipe, blend=self.blend, cull=self.cull,
+                tangents=tangents)
         except Exception:
             return es_shaders.ensure_fallback()
 
@@ -242,6 +274,10 @@ class Object3D(object):
         # One UV channel, or [] when the geometry carries no texture coords:
         # a_uv is a per-mesh attribute, so it is all-or-nothing.
         self.uvs = []
+        # Per-vertex tangents, baked by build_mesh only for a material that
+        # reads a tangent space. Same all-or-nothing rule as a_uv, because
+        # draw() raises when a program binds an attribute the layout lacks.
+        self.tangents = []
         self.mesh = None
         self._last_st = None
 
@@ -265,12 +301,20 @@ class Object3D(object):
 
     def build_mesh(self):
         v, n, t = self.centered()
-        if self.uvs:
+        if self.uvs and self.material.wants_tangents():
+            # Baked once, here, in the same space the vertices are uploaded in:
+            # a Y flip is a mirror, so a tangent baked in another space would
+            # carry the wrong handedness for every vertex (see es_tangent).
+            self.tangents = es_tangent.bake(v, n, self.uvs, t)
+        if self.uvs and self.tangents:
+            self.mesh = es_step3.mesh3_from_layout(
+                v, [n, self.uvs, self.tangents], t,
+                [("a_normal", 3), ("a_uv", 2), ("a_tangent", 4)])
+        elif self.uvs:
             # Layout order only has to agree with itself: the shader binds
             # attributes by name through mesh.layout.offset.
             self.mesh = es_step3.mesh3_from_layout(
-                v, [n, self.uvs], t,
-                [("a_normal", 3), ("a_uv", 2)])
+                v, [n, self.uvs], t, [("a_normal", 3), ("a_uv", 2)])
         else:
             self.mesh = es_step3.mesh3_from_lists(v, n, t)
         return self.mesh
@@ -336,6 +380,25 @@ class MeshObject(Object3D):
         return obj
 
 
+def _bind_textures(model, slot0, material):
+    """Insert this draw's textures in sampler order: atlas, map, normal map.
+
+    Ren'Py names a model's samplers by insertion order (gl2draw binds
+    uniforms["tex<i>"] from textures[i]), so every slot under the highest one
+    that has content needs something in it: a material with a normal map but no
+    diffuse map still fills tex1 with the shared 1x1, or the normal map would
+    arrive as tex1 and the program's tex2 would sit unset -- which draw()
+    treats as an error, not as an unused declaration."""
+    model.texture(slot0)
+    map_texture = material.map_texture()
+    normal_texture = material.normal_texture()
+    if normal_texture is not None and map_texture is None:
+        map_texture = es_morph.placeholder()
+    for texture in (map_texture, normal_texture):
+        if texture is not None:
+            model.texture(texture)
+
+
 class ObjectView(Displayable):
     """Drives one Object3D: update() -> uniforms -> matrix -> child render."""
 
@@ -347,16 +410,19 @@ class ObjectView(Displayable):
         self._sync_material()
 
     def _sync_material(self):
-        # a_uv is a geometry fact the material's flags cannot see; it rides
-        # on the key so a UV-carrying mesh never reuses a non-UV program.
+        # a_uv and a_tangent are geometry facts the material's flags cannot
+        # see; they ride on the key so a mesh that binds them never reuses a
+        # program that does not declare them.
         has_uvs = bool(self.obj.uvs)
-        key = self.obj.material.variant_key() + (has_uvs,)
+        has_tangents = bool(self.obj.tangents)
+        key = self.obj.material.variant_key() + (has_uvs, has_tangents)
         if key == self._shader_key and self.model is not None:
             return
         self._shader_key = key
         model = renpy.display.model.Model(size=(self.obj.size, self.obj.size))
         model.shader("renpy.geometry")
-        model.shader(self.obj.material.shader_name(uvs=has_uvs))
+        model.shader(self.obj.material.shader_name(uvs=has_uvs,
+                                                   tangents=has_tangents))
         model.property("depth", True)
         material = self.obj.material
         if material.blend == "alpha clip":
@@ -369,10 +435,7 @@ class ObjectView(Displayable):
         # atlas, so without this a material map would land on tex0 here but
         # tex1 on a skinned split, and one authored fragment could not serve
         # both.
-        model.texture(es_morph.placeholder())
-        texture = self.obj.material.map_texture()
-        if texture is not None:
-            model.texture(texture)
+        _bind_textures(model, es_morph.placeholder(), material)
         model._mesh = self.obj.mesh
         self.model = model
 
@@ -812,6 +875,18 @@ class SkinnedObject(Object3D):
                           morph["nshapes"], morph["nverts"],
                           morph["width"], morph["height"],
                           morph["mscale"], morph["nscale"]))
+            split_material = self.part_materials.get(material_id,
+                                                     self.material)
+            tangents = None
+            if uvs and split_material.wants_tangents():
+                # In buffer space, Y-flipped exactly the way part_verts below
+                # is: the flip is a mirror (det -1) and it negates the sign of
+                # cross(N, T) while leaving the UV layout alone, so a tangent
+                # baked in rig space would carry the wrong handedness for every
+                # vertex on the model.
+                tangents = es_tangent.bake(
+                    [(x, -y, z) for (x, y, z) in verts],
+                    [(nx, -ny, nz) for (nx, ny, nz) in normals], uvs, tris)
             for part_tris, part_joints in es_gltf.split_by_joints(
                     tris, joint_rows, weight_rows, bone_cap):
                 referenced = set()
@@ -863,6 +938,9 @@ class SkinnedObject(Object3D):
                     # straight into split order.
                     frames.append([uvs[g] for g in kept])
                     layout.append(("a_uv", 2))
+                if tangents:
+                    frames.append([tangents[g] for g in kept])
+                    layout.append(("a_tangent", 4))
                 mesh = es_step3.mesh3_from_layout(
                     part_verts, frames, part_indices, layout)
                 count = float(len(part_verts))
@@ -873,9 +951,10 @@ class SkinnedObject(Object3D):
                             sum(v[2] for v in part_verts) / count)
                 self.splits.append({"mesh": mesh, "joints": part_joints,
                                     "model": None, "morph": morph,
-                                    "uvs": bool(uvs), "centroid": centroid,
-                                    "material": self.part_materials.get(
-                                        material_id, self.material)})
+                                    "uvs": bool(uvs),
+                                    "tangents": bool(tangents),
+                                    "centroid": centroid,
+                                    "material": split_material})
         # The palette composes in this buffer space, not rig space: handing
         # the fit to the skeleton once is what keeps FIT out of every frame.
         self.skel.use_fit_space(self.fit, self.fit_inverse)
@@ -906,7 +985,7 @@ class SkinnedView(Displayable):
             # declares tex0/u_sw* (draw() raises on unset uniforms).
             shader_name = material.shader_name(
                 morph=(self.shape_slot_count if morph is not None else 0),
-                uvs=bool(split["uvs"]))
+                uvs=bool(split["uvs"]), tangents=bool(split["tangents"]))
             model.shader(shader_name)
             if morph is not None and not logged_morph_shader:
                 logged_morph_shader = True
@@ -923,11 +1002,8 @@ class SkinnedView(Displayable):
             # one, the shared 1x1 white texture otherwise. Ren'Py names
             # samplers by insertion order, so filling it here is what lets a
             # material's own map count on being tex1 on every split.
-            model.texture(morph["displayable"] if morph is not None
-                          else es_morph.placeholder())
-            texture = material.map_texture()
-            if texture is not None:
-                model.texture(texture)
+            _bind_textures(model, morph["displayable"] if morph is not None
+                           else es_morph.placeholder(), material)
             if morph is not None:
                 model.uniform("u_mscale", morph["mscale"])
                 model.uniform("u_nscale", morph["nscale"])
