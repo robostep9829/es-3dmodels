@@ -11,12 +11,50 @@ Hard lessons encoded here:
 """
 import hashlib
 
+import renpy.display
 from renpy.gl2.gl2shadercache import register_shader
 
 VARIANTS = {}
 RECIPES = {}
 FALLBACK_SHADER = "es_fallback"
 _fallback_done = [False]
+
+# Ren'Py emits `precision mediump float;` into the fragment shader only, so an
+# unqualified float is highp by the vertex default and mediump by the fragment
+# one. GLSL ES requires a variable declared in both stages to carry the same
+# precision, and a GLES linker enforces what Mesa lets slide: u_light_dir,
+# u_view_dir and every varying we hand across are one declaration in both
+# stages. Stating the default explicitly in each makes them agree.
+#
+# This is fragment highp, which GLES2 makes optional. The alternative -- pinning
+# both stages to mediump -- costs v_uv enough precision to shimmer on a 1024
+# map, so a device without fragment highp now fails at compile with a clear
+# message instead of at link with a confusing one.
+_PRECISION = "precision highp float;\n"
+
+
+def _is_gles():
+    """True on the GLES2 renderer, where `precision` is a keyword.
+
+    Desktop GLSL 1.20 has no such statement, so injecting it unconditionally
+    would be a syntax error there. Registration happens from a view's
+    __init__ at label time, long after the renderer exists, but a missing
+    attribute reads as desktop, which is the safe default."""
+    return bool(getattr(getattr(renpy.display, "draw", None), "gles", False))
+
+
+def register_variant(name, variables, vertex, fragment, vfuncs):
+    """Register one compiled program, with the float default pinned per stage.
+
+    The precision statement goes in the functions slot because that is emitted
+    at global scope; ShaderPart parses `variables` line by line and accepts
+    only '{storage} {type} {name}', so a qualifier cannot ride on the
+    declaration itself."""
+    functions = _PRECISION if _is_gles() else ""
+    register_shader(name, variables=variables,
+                    vertex_functions=functions + vfuncs,
+                    fragment_functions=functions,
+                    vertex_200=vertex, fragment_200=fragment)
 
 # Anything register_shader's `variables` block or the engine's own parts
 # already declare. A parameter reusing one of these names would emit a second
@@ -554,8 +592,6 @@ def get_variant(specular=True, normal_viz=False, shininess=16.0,
     # _validate reports non-ASCII sources far better than encode() does.
     source = variables + vfuncs + prelude + vertex + fragment
     name = "es_mat3_" + hashlib.md5(source.encode("ascii")).hexdigest()[:10]
-    register_shader(name, variables=variables,
-                    vertex_functions=vfuncs,
-                    vertex_200=vertex, fragment_200=fragment)
+    register_variant(name, variables, vertex, fragment, vfuncs)
     VARIANTS[key] = name
     return name
