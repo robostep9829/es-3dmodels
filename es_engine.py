@@ -6,7 +6,9 @@ override update() to animate. ObjectView drives one object per frame:
 update() -> uniforms -> nested Transform (model matrix) -> child render.
 
 Proven rules this encodes (see project history):
-- rotation lives in the model matrix (auto-centered pivot), never in verts,
+- rotation lives in the model matrix, never in verts, and its pivot is the fit
+  anchor -- the only point that can be both, since Ren'Py rotates a render
+  about the centre of its buffer,
 - Mesh3 fields are cdef-only: uploads go through es_step3's poked offsets,
 - depth test needs the direct-draw path: show WITHOUT dissolve,
 - normals rotate by a matrix uniform (u_transform collapses them),
@@ -652,13 +654,20 @@ class Skeleton(object):
                     for joint, node in enumerate(self.joint_nodes))
 
 
-def _fit_transforms(half_size, fit_scale, bounds_center):
+def _fit_transforms(half_size, fit_scale, anchor):
     """(fit, fit_inverse): rig space <-> the space the vertex buffer lives in.
 
-    fit carries a rig-space point onto the uploaded verts -- bring the bounds
-    center to the origin, scale to the target size, flip Y (glTF is Y-up, the
-    screen is Y-down), then offset by the half-size the Model draws at.
-    fit_inverse undoes the same steps in reverse order.
+    fit carries a rig-space point onto the uploaded verts -- bring `anchor` to
+    the origin, scale, flip Y (glTF is Y-up, the screen is Y-down), then offset
+    by the half-size the Model draws at. The scale therefore acts about the
+    anchor, and because the Model draws at the centre of its buffer the anchor
+    is also the point `matrixtransform` rotates about.
+
+    That coupling is the reason the anchor is a parameter and not a policy: an
+    asset whose bounding box is not symmetric about its rig origin grows away
+    from the frame when the anchor is the origin, and `pos` cannot pull it back
+    -- pos is applied *after* the rotation, so a spinning model would orbit
+    rather than turn in place. fit_inverse undoes the same steps in reverse.
     """
     import es_gltf
     no_rotation = (0.0, 0.0, 0.0, 1.0)
@@ -667,18 +676,16 @@ def _fit_transforms(half_size, fit_scale, bounds_center):
     pivot = (half_size, half_size, 0.0)
     mul = es_gltf.mat4_mul
     trs = es_gltf.mat4_trs
-    to_bounds_center = trs(tuple(-x for x in bounds_center),
-                           no_rotation, unit_scale)
-    away_from_bounds_center = trs(tuple(bounds_center),
-                                  no_rotation, unit_scale)
+    to_anchor = trs(tuple(-x for x in anchor), no_rotation, unit_scale)
+    away_from_anchor = trs(tuple(anchor), no_rotation, unit_scale)
     to_pivot = trs(pivot, no_rotation, unit_scale)
     away_from_pivot = trs(tuple(-x for x in pivot), no_rotation, unit_scale)
     enlarge = trs(origin, no_rotation, (fit_scale, fit_scale, fit_scale))
     shrink = trs(origin, no_rotation, (1.0 / fit_scale, 1.0 / fit_scale,
                                        1.0 / fit_scale))
     flip_y = trs(origin, no_rotation, (1.0, -1.0, 1.0))
-    return (mul(mul(mul(to_pivot, flip_y), enlarge), to_bounds_center),
-            mul(mul(mul(away_from_bounds_center, shrink), flip_y),
+    return (mul(mul(mul(to_pivot, flip_y), enlarge), to_anchor),
+            mul(mul(mul(away_from_anchor, shrink), flip_y),
                 away_from_pivot))
 
 
@@ -703,10 +710,20 @@ def _view_depth(centroid, size, tilt, angle):
 class SkinnedObject(Object3D):
     """glTF mesh skinned on GPU. update() poses joints, view pushes palette."""
 
+    # Which rig point the fit scales about, and so which point the turntable
+    # turns about: "origin" is the rig's own (0,0,0), "center" the middle of
+    # the whole mesh's bounding box. See _fit_transforms for why one value
+    # decides both.
+    ANCHORS = ("origin", "center")
+
     def __init__(self, gltf, size=600.0, speed=30.0, tilt=25.0, roll=0.0,
                  pos=(0.0, 0.0, 0.0), color=(0.85, 0.8, 0.75), max_bones=None,
-                 target=300.0, recipe=None):
+                 target=300.0, recipe=None, anchor="origin"):
         import es_gltf
+        if anchor not in SkinnedObject.ANCHORS:
+            raise ValueError("SkinnedObject anchor must be one of %r, got %r"
+                             % (list(SkinnedObject.ANCHORS), anchor))
+        self.anchor = anchor
         if isinstance(gltf, basestring):
             gltf = es_gltf.Gltf.load(gltf)
         material = Material(
@@ -788,11 +805,14 @@ class SkinnedObject(Object3D):
         fit_scale = target / extent
         bounds_center = [(bounds_min[k] + bounds_max[k]) / 2.0
                          for k in range(3)]
-        print("ES_FIT nprims=%d extent=%.3f scale=%.3f center=%r size=%.1f target=%.1f" % (
-            len(prim_data), extent, fit_scale,
-            tuple(round(x, 3) for x in bounds_center), self.size, target))
-        self.fit, self.fit_inverse = _fit_transforms(
-            half_size, fit_scale, bounds_center)
+        anchor = bounds_center if self.anchor == "center" else [0.0, 0.0, 0.0]
+        print("ES_FIT nprims=%d extent=%.3f scale=%.3f anchor=%s "
+              "box_off_anchor=%r size=%.1f target=%.1f" % (
+                  len(prim_data), extent, fit_scale, self.anchor,
+                  tuple(round(x * fit_scale, 1) for x in bounds_center),
+                  self.size, target))
+        self.fit, self.fit_inverse = _fit_transforms(half_size, fit_scale,
+                                                     anchor)
         bone_cap = self.material.max_bones
         # Condense by material first: merge primitives sharing a material
         # into one pool, then joint-split each pool. Fewer state changes
@@ -804,9 +824,9 @@ class SkinnedObject(Object3D):
             verts = []
             for point in positions:
                 world_point = es_gltf.mat4_transform_point(node_matrix, point)
-                verts.append(((world_point[0] - bounds_center[0]) * fit_scale,
-                              (world_point[1] - bounds_center[1]) * fit_scale,
-                              (world_point[2] - bounds_center[2]) * fit_scale))
+                verts.append(((world_point[0] - anchor[0]) * fit_scale,
+                              (world_point[1] - anchor[1]) * fit_scale,
+                              (world_point[2] - anchor[2]) * fit_scale))
             unit_normals = []
             for normal in (normals or [(0.0, 0.0, 1.0)] * len(positions)):
                 length = ((normal[0] * normal[0] + normal[1] * normal[1]

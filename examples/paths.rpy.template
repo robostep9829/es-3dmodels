@@ -69,7 +69,16 @@ init 10 python:
                                    0.5 + 0.5 * (st % 2.0))
 
         def skinned():
-            o = TurnedModel(ES_PATHS_GLB, size=900.0, tilt=0.0, target=850.0)
+            # anchor="center" puts the mesh's bounding-box centre at the pivot,
+            # which is what frames a character. The default, "origin", scales
+            # about the rig's own (0, 0, 0) instead -- right for several objects
+            # sharing one coordinate space, and it keeps that relationship as
+            # target changes. The anchor is also the point the turntable turns
+            # about, so an off-centre asset with anchor="origin" orbits rather
+            # than spins, and `pos` cannot fix that: it is applied after the
+            # rotation.
+            o = TurnedModel(ES_PATHS_GLB, size=900.0, tilt=0.0, target=850.0,
+                            anchor="center")
             # Pose a joint by name or index. The override persists until
             # written again, so it survives the turntable above.
             try:
@@ -89,7 +98,8 @@ init 10 python:
                 params={"u_tint": (0.9, 0.45, 0.2), "u_opacity": 0.55},
                 blend="alpha", cull="back")
             o = TurnedModel(ES_PATHS_GLB, size=900.0, tilt=0.0,
-                            target=850.0, recipe="paths_flat")
+                            target=850.0, recipe="paths_flat",
+                            anchor="center")
             # recipe= is a default for the whole object, not a command: any
             # group another mod routed with `applies` keeps that recipe
             # instead. Print this to see what actually landed.
@@ -112,7 +122,8 @@ init 10 python:
         # These select a compiled variant, so set them before building the
         # view: a view already on screen keeps the program it was built with.
         def show_normals():
-            o = TurnedModel(ES_PATHS_GLB, size=900.0, tilt=0.0, target=850.0)
+            o = TurnedModel(ES_PATHS_GLB, size=900.0, tilt=0.0, target=850.0,
+                            anchor="center")
             o.material.normal_viz = True
             return o
 

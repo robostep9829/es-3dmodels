@@ -1,3 +1,9 @@
 *.rpyc
 __pycache__
 *.pyo
+
+# Development-only, kept on disk but never shipped: the harness and the unit
+# tests live beside the code so they survive with it, and a packaged mod should
+# not carry them. HARNESS.md documents how to rebuild everything in harness/ and
+# what each scenario has to assert, so a fresh clone can regenerate them.
+harness/
