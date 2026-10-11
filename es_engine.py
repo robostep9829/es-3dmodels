@@ -189,6 +189,15 @@ class Material(object):
             return es_shaders.ensure_fallback()
 
 
+def _matrix_from_rows(m):
+    """Nested 4x4 rows -> Matrix.
+
+    The constructor reads 16 floats row-major and stores them column-major, so
+    logical row i comes back out as m[i*4], m[i*4+4], m[i*4+8], m[i*4+12].
+    Getting that backwards is silent, not loud."""
+    return _Matrix([float(v) for row in m for v in row])
+
+
 def _object_matrix(obj):
     """The object's model matrix: rotate about its own centre, then move.
 
@@ -485,8 +494,8 @@ class Skeleton(object):
         center and pivot mapping rig space onto the vertex buffer. This pays
         for the conjugations the palette used to redo per frame and per slot.
         """
-        self.fit = fit
-        self.fit_inverse = fit_inverse
+        self.fit = _matrix_from_rows(fit)
+        self.fit_inverse = _matrix_from_rows(fit_inverse)
         self.local_fit = {}
         for node_index in self.local_specs:
             self.local_fit[node_index] = self._to_fit(
@@ -495,10 +504,15 @@ class Skeleton(object):
                                  for ibm in self.inverse_bind]
 
     def _to_fit(self, matrix):
-        """Rig-space matrix -> the same transform in buffer (fit) space."""
-        import es_gltf
-        return es_gltf.mat4_mul(
-            es_gltf.mat4_mul(self.fit, matrix), self.fit_inverse)
+        """Rig-space matrix -> the same transform in buffer (fit) space.
+
+        Matrix arithmetic, not es_gltf's: the whole chain ends up as the mat4
+        uniform the palette uploads, so the tuple round trip bought nothing and
+        cost ~12us a multiply. Tuples are still what the loader hands over, so
+        they are absorbed here rather than at every call site."""
+        if not isinstance(matrix, _Matrix):
+            matrix = _matrix_from_rows(matrix)
+        return self.fit * matrix * self.fit_inverse
 
     def _rest_local(self, node_index):
         """Node's local matrix exactly as the file defines it."""
@@ -554,9 +568,10 @@ class Skeleton(object):
         """Skinning matrix per joint, in buffer space: {joint index: mat4}.
 
         One multiply per hierarchy edge and one per joint -- FIT is already
-        folded into both factors by use_fit_space().
+        folded into both factors by use_fit_space(). Both are Cython Matrix
+        multiplies: at ~215 joints that chain is 430 products a frame, and as
+        Python tuple arithmetic it measured 12us each, so 5ms of the frame.
         """
-        import es_gltf
         local = self.local_fit
         if self.rotation_overrides:
             local = dict(local)
@@ -569,12 +584,9 @@ class Skeleton(object):
             if parent is None:
                 chain[node_index] = local[node_index]
             else:
-                chain[node_index] = es_gltf.mat4_mul(chain[parent],
-                                                     local[node_index])
-        return dict(
-            (joint, es_gltf.mat4_mul(chain[node],
-                                     self.inverse_bind_fit[joint]))
-            for joint, node in enumerate(self.joint_nodes))
+                chain[node_index] = chain[parent] * local[node_index]
+        return dict((joint, chain[node] * self.inverse_bind_fit[joint])
+                    for joint, node in enumerate(self.joint_nodes))
 
 
 def _fit_transforms(half_size, fit_scale, bounds_center):
@@ -940,11 +952,6 @@ class SkinnedView(Displayable):
         self.blend_draws = [i for i, sp in enumerate(obj.splits)
                             if sp["material"].blend == "alpha"]
 
-    @staticmethod
-    def _flatten(matrix):
-        """Row-major 4x4 -> the 16-float list a renpy Matrix is built from."""
-        return [float(matrix[i][j]) for i in range(4) for j in range(4)]
-
     def render(self, w, h, st, at):
         obj = self.obj
         last = obj._last_st
@@ -953,11 +960,10 @@ class SkinnedView(Displayable):
         obj.update(st, dt)
         light = (obj.material.light_dir
                  if obj.material.light_dir is not None else LIGHT_DIR)
-        # skel.update() already answers in buffer space, so a joint matrix
-        # needs no per-slot work here. Splits share joints, so the list +
-        # Matrix construction runs once per joint, not once per slot.
-        palette = dict((joint, _Matrix(self._flatten(bone_matrix)))
-                       for joint, bone_matrix in obj.skel.update().items())
+        # skel.update() already answers in buffer space *and* as Matrix
+        # objects, which is exactly what a mat4 uniform takes -- so there is
+        # nothing to convert here, per slot or per joint.
+        palette = obj.skel.update()
         if self._identity is None:
             self._identity = _Matrix([1.0, 0.0, 0.0, 0.0,
                                       0.0, 1.0, 0.0, 0.0,
