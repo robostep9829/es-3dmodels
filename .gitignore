@@ -2,8 +2,9 @@
 __pycache__
 *.pyo
 
-# Development-only, kept on disk but never shipped: the harness and the unit
-# tests live beside the code so they survive with it, and a packaged mod should
-# not carry them. HARNESS.md documents how to rebuild everything in harness/ and
-# what each scenario has to assert, so a fresh clone can regenerate them.
+# Development-only, kept on disk but never shipped: harness/ holds the scenario
+# runner, the scenarios, their fixture maps and the headless checks. Nothing in
+# the game imports it. HARNESS.md documents how to use the shipped game as an SDK
+# and deliberately stops there -- the tooling is each agent's own to build on top
+# of those facts, so nothing here points at a recipe.
 harness/

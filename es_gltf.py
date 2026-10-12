@@ -18,6 +18,8 @@ import math
 import os
 import struct
 
+import es_fit
+
 _COMP = {5120: ("b", 1), 5121: ("B", 1), 5122: ("h", 2),
          5123: ("H", 2), 5125: ("I", 4), 5126: ("f", 4)}
 _NCOMP = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT4": 16}
@@ -354,13 +356,15 @@ def split_by_joints(tris, joints, weights, cap=24):
     return parts
 
 
-def bind_pose_mesh(gltf, target=300.0):
-    """All meshes baked with their node transforms, fit into +-target/2.
+def bind_pose_mesh(gltf, target=None, anchor="origin"):
+    """All meshes baked with their node transforms, then es_fit's policy.
 
-    Returns (verts, normals, tris, uvs) centered at origin, for rigid
-    display. `uvs` is None if ANY primitive lacks TEXCOORD_0: the attribute
-    layout is per-mesh, so UVs are all-or-nothing. Texture coordinates are
-    passed through in the file's own V convention -- only positions flip.
+    Returns (verts, normals, tris, uvs) for rigid display. `target` is the
+    extent the longest axis is fitted to, or None to keep the file's own units;
+    `anchor` is the point that lands at the centre of the buffer (see es_fit).
+    `uvs` is None if ANY primitive lacks TEXCOORD_0: the attribute layout is
+    per-mesh, so UVs are all-or-nothing. Texture coordinates are passed through
+    in the file's own V convention -- only positions flip.
     """
     world = node_world_matrices(gltf)
     out_v = []
@@ -390,16 +394,7 @@ def bind_pose_mesh(gltf, target=300.0):
                 out_n.append((0.0, 0.0, 1.0))
         for k in range(0, len(idx), 3):
             out_t.append((base + idx[k], base + idx[k + 1], base + idx[k + 2]))
-    xs = [v[0] for v in out_v]
-    ys = [v[1] for v in out_v]
-    zs = [v[2] for v in out_v]
-    cx = (min(xs) + max(xs)) / 2.0
-    cy = (min(ys) + max(ys)) / 2.0
-    cz = (min(zs) + max(zs)) / 2.0
-    extent = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs))
-    scale = (target / extent) if extent > 0 else 1.0
-    out_v = [((x - cx) * scale, (y - cy) * scale, (z - cz) * scale)
-             for (x, y, z) in out_v]
+    out_v, _scale, _anchor = es_fit.fit_positions(out_v, target, anchor)
     # glTF is Y-up, the screen is Y-down: mirror Y on verts and normals,
     # swap winding so front faces stay front. (Skinning reuses this output,
     # so joint matrices get the same treatment at pose time.)

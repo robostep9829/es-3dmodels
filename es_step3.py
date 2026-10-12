@@ -118,14 +118,14 @@ def _count_offset(mesh, off, want, rows):
     base = id(mesh)
     snapshot = ctypes.string_at(base, HEADER)
     try:
-        ctypes.memmove(base + off, struct.pack("i", want), 4)
+        _move(base + off, struct.pack("i", want))
         if _i32(ctypes.string_at(base, HEADER), off) != want:
             return False
         return len(rows(mesh)) == want
     except Exception:
         return False
     finally:
-        ctypes.memmove(base, snapshot, HEADER)
+        _move(base, snapshot)
 
 
 def _find_count_offset(n, t):
@@ -216,8 +216,8 @@ def _round_trip(offsets):
     tris = [(0, 1, 2)]
     m = Mesh3(layout, len(verts), len(tris))
     base = id(m)
-    ctypes.memmove(base + offsets["OFF_POINTS"], struct.pack("i", len(verts)), 4)
-    ctypes.memmove(base + offsets["OFF_TRIS"], struct.pack("i", len(tris)), 4)
+    _move(base + offsets["OFF_POINTS"], struct.pack("i", len(verts)))
+    _move(base + offsets["OFF_TRIS"], struct.pack("i", len(tris)))
     _write_buffers(base, verts, normals, tris, offsets)
     got_points = [tuple(p[:3]) for p in m.get_points()]
     got_tris = m.get_triangles()
@@ -272,6 +272,20 @@ def _raw(ctype_code, values):
     return out.tobytes() if hasattr(out, "tobytes") else out.tostring()
 
 
+def _move(dst, data):
+    """memmove that keeps the source referenced for the whole call.
+
+    Every buffer written here is produced by a function call, so passing it
+    straight into ctypes.memmove hands the interpreter a temporary whose only
+    owner is the argument tuple -- and ctypes takes the buffer *address*, not
+    the object. Binding the data to a name first is what makes the source
+    provably alive when the copy runs. Deriving the count from the data also
+    removes the second way a write can end up the wrong size: recomputing it
+    from the vertex list.
+    """
+    ctypes.memmove(dst, data, len(data))
+
+
 def _pack_points(verts, offsets=None):
     fmt = (offsets or {}).get("POINT_FMT") or POINT_FMT
     flat = [float(v[i]) for v in verts for i in (0, 1, 2)]
@@ -287,12 +301,11 @@ def _write_buffers(base_or_addrs, verts, normals, tris, offsets=None):
         p_point = _ptr(base, offsets["OFF_POINT"])
         p_attr = _ptr(base, offsets["OFF_ATTR"])
         p_tri = _ptr(base, offsets["OFF_TRI"])
-    ctypes.memmove(p_point, _pack_points(verts, offsets),
-                   len(verts) * 3 * struct.calcsize(offsets["POINT_FMT"]))
+    _move(p_point, _pack_points(verts, offsets))
     flat_n = [float(v[i]) for v in normals for i in (0, 1, 2)]
     flat_t = [int(i) for tri in tris for i in tri]
-    ctypes.memmove(p_attr, _raw("f", flat_n), len(flat_n) * 4)
-    ctypes.memmove(p_tri, _raw("H", flat_t), len(flat_t) * 2)
+    _move(p_attr, _raw("f", flat_n))
+    _move(p_tri, _raw("H", flat_t))
 
 
 def mesh3_from_lists(verts, normals, tris):
@@ -304,8 +317,8 @@ def mesh3_from_lists(verts, normals, tris):
     n, t = len(verts), len(tris)
     m = Mesh3(l, n, t)
     base = id(m)
-    ctypes.memmove(base + OFF_POINTS, struct.pack("i", n), 4)
-    ctypes.memmove(base + OFF_TRIS, struct.pack("i", t), 4)
+    _move(base + OFF_POINTS, struct.pack("i", n))
+    _move(base + OFF_TRIS, struct.pack("i", t))
     _write_buffers(base, verts, normals, tris)
     _ADDRS[id(m)] = (_ptr(base, OFF_POINT), _ptr(base, OFF_ATTR),
                      _ptr(base, OFF_TRI))
@@ -324,8 +337,8 @@ def mesh3_from_layout(verts, attrib_frames, tris, layout_spec):
     n, t = len(verts), len(tris)
     m = Mesh3(l, n, t)
     base = id(m)
-    ctypes.memmove(base + OFF_POINTS, struct.pack("i", n), 4)
-    ctypes.memmove(base + OFF_TRIS, struct.pack("i", t), 4)
+    _move(base + OFF_POINTS, struct.pack("i", n))
+    _move(base + OFF_TRIS, struct.pack("i", t))
     frames = []
     for k in range(n):
         for frame in attrib_frames:
@@ -334,11 +347,10 @@ def mesh3_from_layout(verts, attrib_frames, tris, layout_spec):
     p_point = _ptr(base, OFF_POINT)
     p_attr = _ptr(base, OFF_ATTR)
     p_tri = _ptr(base, OFF_TRI)
-    ctypes.memmove(p_point, _pack_points(verts),
-                   n * 3 * struct.calcsize(POINT_FMT))
-    ctypes.memmove(p_attr, _raw("f", frames), len(frames) * 4)
+    _move(p_point, _pack_points(verts))
+    _move(p_attr, _raw("f", frames))
     flat_t = [int(i) for tri in tris for i in tri]
-    ctypes.memmove(p_tri, _raw("H", flat_t), len(flat_t) * 2)
+    _move(p_tri, _raw("H", flat_t))
     _ADDRS[id(m)] = (p_point, p_attr, p_tri)
     return m
 
@@ -347,10 +359,9 @@ def mesh3_update(m, verts, normals):
     # Только вершины+нормали (топология фиксирована): без malloc/free каждый кадр.
     _check_layout()
     p_point, p_attr, p_tri = _ADDRS[id(m)]
-    ctypes.memmove(p_point, _pack_points(verts),
-                   len(verts) * 3 * struct.calcsize(POINT_FMT))
+    _move(p_point, _pack_points(verts))
     flat_n = [float(v[i]) for v in normals for i in (0, 1, 2)]
-    ctypes.memmove(p_attr, _raw("f", flat_n), len(flat_n) * 4)
+    _move(p_attr, _raw("f", flat_n))
     return m
 
 
@@ -366,6 +377,6 @@ def mesh3_update_tris(m, tris):
     _check_layout()
     p_point, p_attr, p_tri = _ADDRS[id(m)]
     flat_t = [int(i) for tri in tris for i in tri]
-    ctypes.memmove(p_tri, _raw("H", flat_t), len(flat_t) * 2)
-    ctypes.memmove(id(m) + OFF_TRIS, struct.pack("i", len(tris)), 4)
+    _move(p_tri, _raw("H", flat_t))
+    _move(id(m) + OFF_TRIS, struct.pack("i", len(tris)))
     return m

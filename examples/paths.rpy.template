@@ -38,11 +38,15 @@ init 10 python:
             return o
 
         # --- 2. rigid mesh from an OBJ --------------------------------
-        # Fitted to `target` units, drawn `size` screen pixels.
+        # `target` is the extent the longest axis is fitted to and `anchor`
+        # the point that lands at the buffer centre; both loaders and the
+        # skinned path share that policy through es_fit. Leave target unset
+        # and the mesh stays in the units the file was authored in.
         def from_obj():
             return _eng.MeshObject.from_obj(
                 ES_PATHS_OBJ, size=500.0, speed=45.0, tilt=20.0, roll=0.0,
-                pos=(0.0, 0.0, 0.0), color=(0.85, 0.85, 0.9))
+                pos=(0.0, 0.0, 0.0), color=(0.85, 0.85, 0.9),
+                target=300.0, anchor="center")
 
         # --- 3. glTF, bind pose, still rigid --------------------------
         # es_gltf_bind flattens the rig into (verts, normals, tris, uvs), so a
@@ -50,7 +54,8 @@ init 10 python:
         # way to tell a geometry artifact from a skinning one.
         def from_bind_pose():
             verts, normals, tris, uvs = _eng.es_gltf_bind(ES_PATHS_GLB,
-                                                          target=300.0)
+                                                          target=300.0,
+                                                          anchor="center")
             return _eng.MeshObject.from_data(
                 verts, normals, tris, uvs, size=600.0, speed=30.0, tilt=0.0)
 

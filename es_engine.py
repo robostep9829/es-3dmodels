@@ -36,6 +36,7 @@ import es_gltf
 import es_obj
 import es_morph
 import es_tangent
+import es_fit
 import es_caps
 import es_matlib
 
@@ -44,10 +45,14 @@ print("ES_BUILD fit-space-palette")
 _Matrix = renpy.display.matrix.Matrix
 
 
-def es_gltf_bind(path, target=300.0):
-    """Load a .gltf/.glb bind pose: (verts, normals, tris, uvs), fit to
-    target. `uvs` is None when a primitive has no TEXCOORD_0."""
-    return es_gltf.bind_pose_mesh(es_gltf.Gltf.load(path), target)
+def es_gltf_bind(path, target=None, anchor="origin"):
+    """Load a .gltf/.glb bind pose: (verts, normals, tris, uvs).
+
+    `target` is the extent the longest axis is fitted to, or None to keep the
+    file's own units; `anchor` is es_fit's name for the point that ends up at
+    the centre of the buffer. `uvs` is None when a primitive has no
+    TEXCOORD_0."""
+    return es_gltf.bind_pose_mesh(es_gltf.Gltf.load(path), target, anchor)
 
 
 def define_material(name, fragment, params=None, requires=(), map_path=None,
@@ -367,13 +372,13 @@ class MeshObject(Object3D):
 
     @classmethod
     def from_obj(cls, path, size=500.0, speed=60.0, tilt=25.0, roll=0.0,
-                 pos=(0.0, 0.0, 0.0), color=(0.85, 0.85, 0.9), target=300.0,
-                 recipe=None):
+                 pos=(0.0, 0.0, 0.0), color=(0.85, 0.85, 0.9), target=None,
+                 anchor="origin", recipe=None):
         obj = cls(size=size, speed=speed, tilt=tilt, roll=roll, pos=pos,
                   material=Material(
                       base_color=(color[0], color[1], color[2], 1.0),
                       recipe=recipe))
-        verts, normals, tris, uvs = es_obj.load_obj(path, target)
+        verts, normals, tris, uvs = es_obj.load_obj(path, target, anchor)
         obj.verts = list(verts)
         obj.normals = list(normals)
         obj.tris = list(tris)
@@ -710,20 +715,15 @@ def _view_depth(centroid, size, tilt, angle):
 class SkinnedObject(Object3D):
     """glTF mesh skinned on GPU. update() poses joints, view pushes palette."""
 
-    # Which rig point the fit scales about, and so which point the turntable
-    # turns about: "origin" is the rig's own (0,0,0), "center" the middle of
-    # the whole mesh's bounding box. See _fit_transforms for why one value
-    # decides both.
-    ANCHORS = ("origin", "center")
-
-    def __init__(self, gltf, size=600.0, speed=30.0, tilt=25.0, roll=0.0,
+    def __init__(self, gltf, size=600.0, speed=30.0, tilt=0.0, roll=0.0,
                  pos=(0.0, 0.0, 0.0), color=(0.85, 0.8, 0.75), max_bones=None,
-                 target=300.0, recipe=None, anchor="origin"):
+                 target=None, recipe=None, anchor="origin"):
         import es_gltf
-        if anchor not in SkinnedObject.ANCHORS:
-            raise ValueError("SkinnedObject anchor must be one of %r, got %r"
-                             % (list(SkinnedObject.ANCHORS), anchor))
-        self.anchor = anchor
+        # es_fit owns the anchor vocabulary and the fit maths. `target` is the
+        # extent the longest axis is fitted to, or None to leave the asset in
+        # the units it was authored in -- which for a rig measured in metres is
+        # a few pixels, so a caller that wants a size has to say so.
+        self.anchor = es_fit.normalize_anchor(anchor)
         if isinstance(gltf, basestring):
             gltf = es_gltf.Gltf.load(gltf)
         material = Material(
@@ -801,16 +801,20 @@ class SkinnedObject(Object3D):
                         bounds_min[axis] = world_point[axis]
                     if world_point[axis] > bounds_max[axis]:
                         bounds_max[axis] = world_point[axis]
-        extent = max(bounds_max[k] - bounds_min[k] for k in range(3)) or 1.0
-        fit_scale = target / extent
-        bounds_center = [(bounds_min[k] + bounds_max[k]) / 2.0
-                         for k in range(3)]
-        anchor = bounds_center if self.anchor == "center" else [0.0, 0.0, 0.0]
-        print("ES_FIT nprims=%d extent=%.3f scale=%.3f anchor=%s "
-              "box_off_anchor=%r size=%.1f target=%.1f" % (
-                  len(prim_data), extent, fit_scale, self.anchor,
-                  tuple(round(x * fit_scale, 1) for x in bounds_center),
-                  self.size, target))
+        fit_scale, anchor = es_fit.fit_for_bounds(bounds_min, bounds_max,
+                                                  target, self.anchor)
+        # How far the box centre sits from the anchor, in buffer units. With
+        # anchor="origin" that is both the framing offset and the radius the
+        # model orbits when it turns, so it is the first number to look at when
+        # a scene frames wrong.
+        box_center = [(bounds_min[k] + bounds_max[k]) / 2.0 for k in range(3)]
+        print("ES_FIT nprims=%d extent=%.3f scale=%.3f anchor=%s target=%r "
+              "box_off_anchor=%r size=%.1f" % (
+                  len(prim_data),
+                  max(bounds_max[k] - bounds_min[k] for k in range(3)),
+                  fit_scale, self.anchor, target,
+                  tuple(round(x * fit_scale, 1) for x in box_center),
+                  self.size))
         self.fit, self.fit_inverse = _fit_transforms(half_size, fit_scale,
                                                      anchor)
         bone_cap = self.material.max_bones

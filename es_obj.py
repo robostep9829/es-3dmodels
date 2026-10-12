@@ -7,12 +7,20 @@ triple, so smooth shading and per-face UVs from the exporter both survive.
 Only one UV channel is read. No mtllib support yet (single material per
 object), so `uvs` is None for files without any vt records.
 """
+import es_fit
 
 
-def load_obj(path, target=300.0):
-    """Returns (verts, normals, tris, uvs) fit into a +-target/2 box.
+def load_obj(path, target=None, anchor="origin"):
+    """Returns (verts, normals, tris, uvs) with es_fit's policy applied.
 
-    `uvs` is None when the file carries no texture coordinates at all.
+    `target` is the extent the longest axis is fitted to, or None to keep the
+    file's own units; `anchor` is the point that lands at the centre of the
+    buffer (see es_fit). Positions only -- a normal is a direction, so it is
+    neither scaled nor moved. `uvs` is None when the file carries no texture
+    coordinates at all.
+
+    Unlike the glTF loaders this one mirrors nothing: an OBJ is drawn with
+    whatever up direction the file was written with.
     """
     verts = []
     texcoords = []
@@ -74,14 +82,7 @@ def load_obj(path, target=300.0):
     if not out_v:
         raise ValueError("no geometry in %r" % (path,))
 
-    xs = [v[0] for v in out_v]
-    ys = [v[1] for v in out_v]
-    zs = [v[2] for v in out_v]
-    cx = (min(xs) + max(xs)) / 2.0
-    cy = (min(ys) + max(ys)) / 2.0
-    cz = (min(zs) + max(zs)) / 2.0
-    extent = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs))
-    scale = (target / extent) if extent > 0 else 1.0
-    out_v = [((x - cx) * scale, (y - cy) * scale, (z - cz) * scale)
-             for (x, y, z) in out_v]
+    # Positions only: a normal is a direction, so neither the scale nor the
+    # anchor subtraction applies to it.
+    out_v, _scale, _anchor = es_fit.fit_positions(out_v, target, anchor)
     return out_v, out_n, out_t, (out_uv if has_uv else None)

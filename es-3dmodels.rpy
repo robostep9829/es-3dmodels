@@ -26,7 +26,7 @@ init python:
     # .mat/.glsl files instead of serving stale programs inside one process.
     config.reload_modules += ["es_matlib", "es_engine", "es_shaders",
                               "es_gltf", "es_obj", "es_morph", "es_step3",
-                              "es_caps", "es_tangent"]
+                              "es_caps", "es_tangent", "es_fit"]
 
 
 init python:

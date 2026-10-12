@@ -46,13 +46,16 @@ label YOURMOD:
     show expression Solid("#e08c14", xsize=1280, ysize=720) as bg at truecenter
     pause 0.3
 
-    # Geometry from an OBJ: verts, normals and tris are fitted to `target`,
-    # then the whole thing is scaled to `size` screen pixels. The loaders open
-    # paths with plain open(), so resolve the game-relative name first --
-    # transfn finds the file on disk or inside an .rpa.
+    # Geometry from an OBJ: the loaders open paths with plain open(), so
+    # resolve the game-relative name first -- transfn finds the file on disk or
+    # inside an .rpa. `target` is the size the model's longest axis becomes, in
+    # buffer pixels (None leaves it in the units the file was authored in, which
+    # for a metre-scale model is about two pixels). `size` is NOT a scale: it is
+    # the render buffer the model is drawn into, and its centre is the pivot.
     $ _objpath = renpy.loader.transfn(YOURMOD_DIR + "/game-ready.obj")
     $ _obj = _eng.MeshObject.from_obj(
-        _objpath, size=500.0, speed=45.0, tilt=20.0)
+        _objpath, size=500.0, speed=45.0, tilt=20.0,
+        target=300.0, anchor="center")
 
     # Show it WITHOUT a transition. The depth test needs the direct-draw path,
     # and `with dissolve` routes the view through an off-screen buffer.
